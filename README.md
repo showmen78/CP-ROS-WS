@@ -119,13 +119,10 @@ The ROS package is located in `src/cpx_comm_test`.
 
 ## Run OpenCDA
 
-First, start the CARLA 0.9.12 server in a separate terminal:
+First, start the CARLA 0.9.12 server in a separate terminal (change the path):
 
 ```bash
 export UE4_ROOT=/home/umd-user/carla_source/UnrealEngine_4.26
-export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
-export __NV_PRIME_RENDER_OFFLOAD=1
-export __GLX_VENDOR_LIBRARY_NAME=nvidia
 
 "$UE4_ROOT/Engine/Binaries/Linux/UE4Editor" \
   /home/umd-user/carla_source/carla/Unreal/CarlaUE4/CarlaUE4.uproject \
@@ -134,14 +131,14 @@ export __GLX_VENDOR_LIBRARY_NAME=nvidia
 ```
 
 Wait until the CARLA server is ready on port 2000. Then open another terminal
-and run the OpenCDA-wrapper scenario:
+and run the scenario:
 
 ```bash
 conda activate carla307
 cd /path/to/CP-X-planning-module
 python opencda.py -t cpx_town10_scenario_1 -v 0.9.12
 ```
-
+Note: Change the name of the conda environment.
 ## Build this ROS workspace
 
 ```bash
