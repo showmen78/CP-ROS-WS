@@ -1,0 +1,27 @@
+# ROS 2 generated directories
+/build/
+/install/
+/log/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors and operating-system files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Runtime logs
+*.log
