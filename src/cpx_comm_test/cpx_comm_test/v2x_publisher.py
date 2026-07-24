@@ -1,12 +1,13 @@
-"""Publish OpenCDA perception output as Autoware predicted objects."""
+"""Publish nearby OpenCDA V2X CAVs as Autoware tracked objects."""
 
 import math
 import uuid
 
 from autoware_perception_msgs.msg import ObjectClassification
-from autoware_perception_msgs.msg import PredictedObject
-from autoware_perception_msgs.msg import PredictedObjects
 from autoware_perception_msgs.msg import Shape
+from autoware_perception_msgs.msg import TrackedObject
+from autoware_perception_msgs.msg import TrackedObjectKinematics
+from autoware_perception_msgs.msg import TrackedObjects
 import rclpy
 from rclpy.node import Node
 
@@ -24,40 +25,38 @@ def _set_stamp(stamp, timestamp_s):
 def _classification_label(type_name):
     """Convert an OpenCDA type name to an Autoware class."""
     name = str(type_name).lower()
-    if "pedestrian" in name or "walker" in name:
-        return ObjectClassification.PEDESTRIAN
-    if "motorcycle" in name:
-        return ObjectClassification.MOTORCYCLE
-    if "bicycle" in name or "bike" in name:
-        return ObjectClassification.BICYCLE
     if "truck" in name:
         return ObjectClassification.TRUCK
     if "trailer" in name:
         return ObjectClassification.TRAILER
     if "bus" in name:
         return ObjectClassification.BUS
+    if "motorcycle" in name:
+        return ObjectClassification.MOTORCYCLE
+    if "bicycle" in name or "bike" in name:
+        return ObjectClassification.BICYCLE
     if "vehicle" in name or "car" in name:
         return ObjectClassification.CAR
     return ObjectClassification.UNKNOWN
 
 
-class PerceptionPublisher(Node):
-    """Receive perception JSON and publish predicted objects."""
+class V2XPublisher(Node):
+    """Receive nearby-CAV JSON and publish tracked objects."""
 
     def __init__(self):
-        super().__init__("perception_publisher")
+        super().__init__("v2x_publisher")
         self.publisher = self.create_publisher(
-            PredictedObjects,
-            "/cpx/perception",
+            TrackedObjects,
+            "/cpx/v2x",
             10,
         )
-        self.receiver = TcpJsonReceiver(5052, self.get_logger())
+        self.receiver = TcpJsonReceiver(5054, self.get_logger())
         self.create_timer(0.02, self.publish_messages)
 
     def publish_messages(self):
         for data in self.receiver.get_messages():
             payload = data.get("data", data)
-            message = PredictedObjects()
+            message = TrackedObjects()
             timestamp_s = data.get(
                 "timestamp_s",
                 self.get_clock().now().nanoseconds / 1e9,
@@ -65,66 +64,57 @@ class PerceptionPublisher(Node):
             _set_stamp(message.header.stamp, timestamp_s)
             message.header.frame_id = str(data.get("frame_id", "map"))
 
-            for item in payload.get("objects", []):
-                predicted = PredictedObject()
-                object_id = str(
+            for item in payload.get("nearby_cavs", []):
+                tracked = TrackedObject()
+                cav_id = str(
                     item.get("id", item.get("vehicle_id", ""))
                 )
-                predicted.object_id.uuid = list(
+                tracked.object_id.uuid = list(
                     uuid.uuid5(
                         uuid.NAMESPACE_URL,
-                        "cpx:perception:{}".format(object_id),
+                        "cpx:v2x:{}".format(cav_id),
                     ).bytes
                 )
 
                 confidence = float(item.get("confidence", 1.0))
-                predicted.existence_probability = confidence
+                tracked.existence_probability = confidence
 
                 classification = ObjectClassification()
                 classification.label = _classification_label(
                     item.get("type", "")
                 )
                 classification.probability = confidence
-                predicted.classification = [classification]
+                tracked.classification = [classification]
 
-                pose = (
-                    predicted.kinematics
-                    .initial_pose_with_covariance.pose
-                )
+                pose = tracked.kinematics.pose_with_covariance.pose
                 pose.position.x = float(item.get("x", 0.0))
                 pose.position.y = float(item.get("y", 0.0))
                 pose.position.z = float(item.get("z", 0.0))
 
-                yaw = item.get("psi")
-                if yaw is None:
-                    pose.orientation.w = 1.0
-                else:
-                    yaw = float(yaw)
-                    pose.orientation.z = math.sin(yaw / 2.0)
-                    pose.orientation.w = math.cos(yaw / 2.0)
+                yaw = float(item.get("psi", 0.0))
+                pose.orientation.z = math.sin(yaw / 2.0)
+                pose.orientation.w = math.cos(yaw / 2.0)
+                tracked.kinematics.orientation_availability = (
+                    TrackedObjectKinematics.AVAILABLE
+                )
 
                 speed = float(item.get("v", 0.0))
-                twist = (
-                    predicted.kinematics
-                    .initial_twist_with_covariance.twist
+                tracked.kinematics.twist_with_covariance.twist.linear.x = (
+                    speed
                 )
-                twist.linear.x = speed
+                tracked.kinematics.is_stationary = abs(speed) < 0.1
 
-                # OpenCDA currently sends no future trajectory. The
-                # variable-length ROS array is intentionally left empty.
-                predicted.kinematics.predicted_paths = []
-
-                predicted.shape.type = Shape.BOUNDING_BOX
-                predicted.shape.dimensions.x = float(
+                tracked.shape.type = Shape.BOUNDING_BOX
+                tracked.shape.dimensions.x = float(
                     item.get("length_m") or 0.0
                 )
-                predicted.shape.dimensions.y = float(
+                tracked.shape.dimensions.y = float(
                     item.get("width_m") or 0.0
                 )
-                predicted.shape.dimensions.z = float(
+                tracked.shape.dimensions.z = float(
                     item.get("height_m") or 0.0
                 )
-                message.objects.append(predicted)
+                message.objects.append(tracked)
 
             self.publisher.publish(message)
 
@@ -135,7 +125,7 @@ class PerceptionPublisher(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PerceptionPublisher()
+    node = V2XPublisher()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

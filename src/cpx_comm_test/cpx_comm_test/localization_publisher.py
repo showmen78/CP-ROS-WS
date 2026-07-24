@@ -1,21 +1,29 @@
-"""Publish OpenCDA localization output on a ROS 2 topic."""
+"""Publish OpenCDA localization output as ROS 2 odometry."""
 
-import json
+import math
 
+from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
 
 from .tcp_json_receiver import TcpJsonReceiver
 
 
+def _set_stamp(stamp, timestamp_s):
+    """Convert a floating-point Unix time to a ROS time."""
+    seconds = int(timestamp_s)
+    nanoseconds = int((float(timestamp_s) - seconds) * 1000000000)
+    stamp.sec = seconds
+    stamp.nanosec = nanoseconds
+
+
 class LocalizationPublisher(Node):
-    """Receive localization JSON on port 5051 and publish it."""
+    """Receive localization JSON and publish ROS odometry."""
 
     def __init__(self):
         super().__init__("localization_publisher")
         self.publisher = self.create_publisher(
-            String,
+            Odometry,
             "/cpx/localization",
             10,
         )
@@ -24,8 +32,35 @@ class LocalizationPublisher(Node):
 
     def publish_messages(self):
         for data in self.receiver.get_messages():
-            message = String()
-            message.data = json.dumps(data)
+            payload = data.get("data", data)
+            ego_state = payload.get("ego_state", {})
+
+            message = Odometry()
+            timestamp_s = data.get(
+                "timestamp_s",
+                self.get_clock().now().nanoseconds / 1e9,
+            )
+            _set_stamp(message.header.stamp, timestamp_s)
+            message.header.frame_id = str(data.get("frame_id", "map"))
+            message.child_frame_id = "base_link"
+
+            message.pose.pose.position.x = float(
+                ego_state.get("x", 0.0)
+            )
+            message.pose.pose.position.y = float(
+                ego_state.get("y", 0.0)
+            )
+            message.pose.pose.position.z = float(
+                ego_state.get("z", 0.0)
+            )
+
+            yaw = float(ego_state.get("psi", 0.0))
+            message.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            message.pose.pose.orientation.w = math.cos(yaw / 2.0)
+            message.twist.twist.linear.x = float(
+                ego_state.get("v", 0.0)
+            )
+
             self.publisher.publish(message)
 
     def destroy_node(self):

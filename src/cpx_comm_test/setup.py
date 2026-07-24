@@ -30,6 +30,9 @@ setup(
             'cpx_comm_test.perception_publisher:main',
             'traffic_light_publisher = '
             'cpx_comm_test.traffic_light_publisher:main',
+            'v2x_publisher = cpx_comm_test.v2x_publisher:main',
+            'cooperative_message_publisher = '
+            'cpx_comm_test.cooperative_message_publisher:main',
             'data_subscriber = cpx_comm_test.data_subscriber:main',
         ],
     },
