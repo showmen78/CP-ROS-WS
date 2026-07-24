@@ -10,6 +10,9 @@ from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
 
+from .tcp_json_sender import ros_message_to_dict
+from .tcp_json_sender import TcpJsonSender
+
 
 # Keeping the topic name and its message type together makes it easy to add
 # another input later without copying the subscription code.
@@ -34,6 +37,10 @@ class DataSubscriber(Node):
     def __init__(self):
         super().__init__("opencda_data_subscriber")
 
+        # Port 5060 carries the typed ROS data back to Python 3.7/OpenCDA.
+        self.sender = TcpJsonSender(5060, self.get_logger())
+        self.sequence = 0
+
         # Create one subscription for every data stream listed above.
         for data_type, (message_class, topic_name) in TOPICS.items():
             self.create_subscription(
@@ -51,11 +58,29 @@ class DataSubscriber(Node):
         self.get_logger().info("Listening to all five OpenCDA topics.")
 
     def print_message(self, data_type, message):
-        """Print one typed ROS message."""
+        """Print one typed ROS message and send a JSON copy to OpenCDA."""
         # ROS already formats typed messages in a readable field-by-field form.
         self.get_logger().info(
             "{} data:\n{}".format(data_type, message)
         )
+
+        # Give each forwarded update a number so its order is easy to check.
+        self.sequence += 1
+        forwarded_data = {
+            "schema_version": 1,
+            "sequence": self.sequence,
+            "timestamp_s": (
+                self.get_clock().now().nanoseconds / 1000000000.0
+            ),
+            "message_type": data_type,
+            "data": ros_message_to_dict(message),
+        }
+        self.sender.send(forwarded_data)
+
+    def destroy_node(self):
+        """Close the TCP connection before shutting down the ROS node."""
+        self.sender.close()
+        super().destroy_node()
 
 
 def main(args=None):
