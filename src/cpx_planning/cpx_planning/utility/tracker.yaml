@@ -1,0 +1,27 @@
+tracker:
+  # Polynomial degree used to fit each tracked object's recent x(t) and y(t)
+  # history before forward prediction.
+  # Increase -> can match more curvature, but overfits noisy motion more easily.
+  # Decrease -> smoother prediction, but less able to fit curved motion.
+  polynomial_degree: 3
+
+  # Amount of recent history [s] used for polynomial fitting.
+  # Increase -> smoother, slower-changing prediction model.
+  # Decrease -> prediction reacts faster to new motion changes.
+  fit_window_s: 4.0
+
+  # Hard cap on stored history samples per object.
+  # Increase -> more data retained, slightly more memory/fit cost.
+  # Decrease -> smaller memory footprint, but shorter usable history.
+  max_history_points: 200
+
+  # Minimum number of samples required before polynomial fitting is allowed.
+  # Increase -> more reliable fits, but prediction starts later.
+  # Decrease -> prediction starts earlier, but can be noisy or unstable.
+  min_points_for_polyfit: 3
+
+  # Maximum age [s] of the tracked next-signal context before it is considered stale.
+  signal_context_timeout_s: 1.0
+
+  # History length for the tracked next-traffic-signal observations.
+  signal_history_points: 20

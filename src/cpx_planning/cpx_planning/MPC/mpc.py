@@ -1,0 +1,2888 @@
+"""
+LTV-MPC (QP + OSQP) for MPC_custom.
+
+Model and optimization summary:
+1. State:  X_k = [x_k, y_k, v_k, psi_k]
+2. Input:  U_k = [a_k, delta_k]
+3. Nonlinear kinematic bicycle model (CG-reference with slip angle beta) is
+   used for reference rollout.
+4. Dynamics are linearized around the reference rollout (LTV form).
+5. The resulting convex QP is solved with OSQP.
+6. Output is the future state sequence only (no control sequence returned).
+
+Cost function:
+    J_total = sum_{k=1..N} (
+        Cost_ref + Cost_LaneCenter + Cost_RoadBoundary + Cost_Repulsive + Cost_Control
+    )
+
+    Cost_ref:
+      quadratic pull toward destination reference state.
+
+    Cost_LaneCenter:
+      soft lane-center tracking term when enabled.
+
+    Cost_RoadBoundary:
+      piecewise-quadratic road-edge proximity penalty using nonnegative slacks.
+
+    Cost_Repulsive:
+      obstacle repulsive potential field, approximated in QP form.
+
+    Cost_Control:
+      control smoothness cost using acceleration-rate and steering-rate penalties.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+import time
+from typing import Dict, List, Mapping, Sequence, Tuple
+
+import numpy as np
+import scipy.sparse as sp
+
+from .lane_keep import (
+    LaneKeepingProfile,
+    evaluate_lane_keeping_profile,
+    normalize_lane_reference_sample,
+    signed_lateral_offset_affine_form,
+)
+
+try:
+    import osqp
+
+    _OSQP_AVAILABLE = True
+except Exception:  # pragma: no cover - import error path depends on environment
+    osqp = None  # type: ignore[assignment]
+    _OSQP_AVAILABLE = False
+
+
+
+@dataclass
+class MPCConstraintSpec:
+    """Hard bounds and enabled safety constraints used by the QP."""
+
+    min_velocity_mps: float
+    max_velocity_mps: float
+    min_acceleration_mps2: float
+    max_acceleration_mps2: float
+    max_jerk_mps3: float
+    min_steer_rad: float
+    max_steer_rad: float
+    min_steer_rate_rps: float
+    max_steer_rate_rps: float
+    enforce_terminal_velocity_constraint: bool
+    terminal_velocity_mps: float
+
+
+@dataclass
+class MPCComfortCostSpec:
+    """Comfort cost weights for J_ctrl (reference tracking is in J_safe by user request)."""
+
+    w_comf: float
+    qx: float
+    qy: float
+    qv: float
+    qpsi: float
+    qa: float
+    qdelta: float
+
+
+@dataclass
+class MPCSafetyCostSpec:
+    """Safety cost top-level weight for reference-state tracking."""
+
+    w_safe: float
+
+
+@dataclass
+class MPCRepulsivePotentialSpec:
+    """
+    Super-ellipsoid collision-potential configuration.
+
+    For each obstacle and stage:
+        J_obs = w_c * exp(-k_c * (r_c - s_c))
+
+    where:
+        r_c : normalized distance to the tighter collision zone
+        w_c : collision-zone weight
+        k_c : collision-zone exponential gain
+        s_c : collision-zone distance shift
+    """
+
+    enabled: bool
+    w_safe_zone: float
+    w_collision_zone: float
+    safe_exponential_gain: float
+    safe_distance_shift: float
+    collision_exponential_gain: float
+    collision_distance_shift: float
+    max_braking_deceleration_mps2: float
+    comfort_deceleration_mps2: float
+    reaction_time_s: float
+    static_longitudinal_buffer_m: float
+    static_lateral_buffer_m: float
+    shape_exponent: float
+    min_lateral_approach_speed_mps: float
+    max_longitudinal_zone_length_m: float
+    limit_lateral_zone_to_lane_width: bool
+    max_lateral_zone_lane_fraction: float
+    project_hessian_psd: bool
+    min_hessian_eig: float
+
+
+@dataclass
+class QPIndex:
+    """
+    Decision-variable indexing helper.
+
+    Variable layout:
+        z = [X(0..N), U(0..N-1), S_road_left/right(1..N)]
+    """
+
+    nx: int
+    nu: int
+    horizon_steps: int
+    road_boundary_slack_pair_count: int = 0
+
+    @property
+    def state_offset(self) -> int:
+        return 0
+
+    @property
+    def control_offset(self) -> int:
+        return (self.horizon_steps + 1) * self.nx
+
+    @property
+    def road_boundary_slack_offset(self) -> int:
+        return self.control_offset + self.horizon_steps * self.nu
+
+    @property
+    def road_boundary_slack_count(self) -> int:
+        return 2 * int(self.road_boundary_slack_pair_count)
+
+    @property
+    def total_variables(self) -> int:
+        return self.road_boundary_slack_offset + self.road_boundary_slack_count
+
+    def state_index(self, k: int, i: int) -> int:
+        return self.state_offset + k * self.nx + i
+
+    def control_index(self, k: int, i: int) -> int:
+        return self.control_offset + k * self.nu + i
+
+    def road_boundary_left_slack_index(self, k: int) -> int:
+        return self.road_boundary_slack_offset + 2 * (k - 1)
+
+    def road_boundary_right_slack_index(self, k: int) -> int:
+        return self.road_boundary_slack_offset + 2 * (k - 1) + 1
+
+
+class MPC:
+
+    """
+    Intent:
+        Compute an optimal future trajectory of states [x,y,v,psi] over a finite
+        horizon using an LTV-MPC QP solved by OSQP.
+
+    Inputs to `plan_trajectory`:
+        current_state:
+            sequence[float], shape (4), [x, y, v, psi]
+        destination_state:
+            sequence[float], shape (2) or (4), [x, y, v, psi]
+        object_snapshots:
+            sequence of non-ego object snapshots. Each snapshot may include
+            tracker predictions under `predicted_trajectory`.
+        current_acceleration_mps2:
+            float, previous applied acceleration command for jerk penalty/constraint.
+        current_steering_rad:
+            float, previous applied steering command for smoothness.
+
+    Output:
+        list[list[float]], shape (M, 4), future states for k=1..M where
+        M<=N if the destination is reached within the horizon.
+    """
+
+    def __init__(
+        self,
+        mpc_cfg: Mapping[str, object],
+        road_cfg: Mapping[str, object],
+    ) -> None:
+
+        self.horizon_s = float(mpc_cfg.get("horizon_s", 5.0))
+        self.dt_s = float(mpc_cfg.get("plan_dt_s", 0.05))
+        if self.horizon_s <= 0.0 or self.dt_s <= 0.0:
+            raise ValueError("mpc.horizon_s and mpc.plan_dt_s must be > 0.")
+        self.horizon_steps = max(1, int(round(self.horizon_s / self.dt_s)))
+        self.horizon_s = float(self.horizon_steps * self.dt_s)
+
+        self.trajectory_generation_frequency_hz = max(
+            1e-3,
+            float(mpc_cfg.get("trajectory_generation_frequency_hz", 2.0)),
+        )
+        self.trajectory_generation_period_s = 1.0 / self.trajectory_generation_frequency_hz
+
+        self.destination_reached_threshold_m = max(
+            0.05,
+            float(mpc_cfg.get("destination_reached_threshold_m", 0.5)),
+        )
+
+        self.wheelbase_m = float(mpc_cfg.get("wheelbase_m", 2.7))
+        if self.wheelbase_m <= 0.0:
+            raise ValueError("mpc.wheelbase_m must be > 0.")
+        # CG-reference model parameters. In this project we assume the CG is
+        # centered between axles unless a scenario-specific axle split is added.
+        self.l_r_m = max(1e-9, 0.5 * float(self.wheelbase_m))
+        self.ego_length_m = max(0.0, float(mpc_cfg.get("ego_length_m", 0.0)))
+        self.ego_width_m = max(0.0, float(mpc_cfg.get("ego_width_m", 0.0)))
+
+        constraints_cfg = dict(mpc_cfg.get("constraints", {}))
+        lane_count = max(1, int(road_cfg.get("lane_count", 3)))
+        self.lane_count = int(lane_count)
+        lane_width_m = float(road_cfg.get("lane_width_m", 4.0))
+        self.lane_width_m = float(lane_width_m)
+        self.constraints = MPCConstraintSpec(
+            min_velocity_mps=float(constraints_cfg.get("min_velocity_mps", 0.0)),
+            max_velocity_mps=float(constraints_cfg.get("max_velocity_mps", 15.0)),
+            min_acceleration_mps2=float(constraints_cfg.get("min_acceleration_mps2", -3.0)),
+            max_acceleration_mps2=float(constraints_cfg.get("max_acceleration_mps2", 3.0)),
+            max_jerk_mps3=abs(float(constraints_cfg.get("max_jerk_mps3", 10.0))),
+            min_steer_rad=float(constraints_cfg.get("min_steer_rad", -0.3)),
+            max_steer_rad=float(constraints_cfg.get("max_steer_rad", 0.3)),
+            min_steer_rate_rps=min(
+                float(constraints_cfg.get("min_steer_rate_rps", -0.02)),
+                float(constraints_cfg.get("max_steer_rate_rps", 0.02)),
+            ),
+            max_steer_rate_rps=max(
+                float(constraints_cfg.get("min_steer_rate_rps", -0.02)),
+                float(constraints_cfg.get("max_steer_rate_rps", 0.02)),
+            ),
+            enforce_terminal_velocity_constraint=bool(constraints_cfg.get("enforce_terminal_velocity_constraint", True)),
+            terminal_velocity_mps=float(constraints_cfg.get("terminal_velocity_mps", 0.0)),
+        )
+        final_stop_speed_cap_cfg = dict(mpc_cfg.get("final_stop_speed_cap", {}))
+        self.final_stop_speed_cap_enabled = bool(final_stop_speed_cap_cfg.get("enabled", True))
+        self.final_stop_speed_cap_activation_threshold_mps = max(
+            0.0,
+            float(final_stop_speed_cap_cfg.get("destination_speed_activation_threshold_mps", 0.05)),
+        )
+        self.final_stop_speed_cap_stop_buffer_m = max(
+            0.0,
+            float(final_stop_speed_cap_cfg.get("stop_buffer_m", 2.0)),
+        )
+
+        cost_cfg = dict(mpc_cfg.get("cost", {}))
+        attractive_cfg = dict(cost_cfg.get("attractive", {}))
+        control_cfg = dict(cost_cfg.get("control", {}))
+        self.comfort_cost = MPCComfortCostSpec(
+            # Control weight (legacy fallback: cost.w_comf).
+            w_comf=max(0.0, float(control_cfg.get("w_control", cost_cfg.get("w_comf", 0.3)))),
+            # Attractive term weights (legacy fallback: cost.q_*).
+            qx=max(0.0, float(attractive_cfg.get("q_x", cost_cfg.get("q_x", 5.0)))),
+            qy=max(0.0, float(attractive_cfg.get("q_y", cost_cfg.get("q_y", 8.0)))),
+            qv=max(0.0, float(attractive_cfg.get("q_v", cost_cfg.get("q_v", 2.0)))),
+            qpsi=max(0.0, float(attractive_cfg.get("q_psi", cost_cfg.get("q_psi", 4.0)))),
+            # Control-rate weights (legacy fallback: cost.q_a, cost.q_delta).
+            qa=max(0.0, float(control_cfg.get("q_a", cost_cfg.get("q_a", 2.0)))),
+            qdelta=max(0.0, float(control_cfg.get("q_delta", cost_cfg.get("q_delta", 4.0)))),
+        )
+        self.safety_cost = MPCSafetyCostSpec(
+            # Attractive weight (legacy fallback: cost.w_safe).
+            w_safe=max(0.0, float(attractive_cfg.get("w_attractive", cost_cfg.get("w_safe", 0.7)))),
+        )
+        repulsive_cfg = dict(cost_cfg.get("repulsive_potential", {}))
+        legacy_static_buffer_m = max(0.0, float(repulsive_cfg.get("static_buffer_m", 0.5)))
+        self.repulsive_cost = MPCRepulsivePotentialSpec(
+            enabled=bool(repulsive_cfg.get("enabled", True)),
+            w_safe_zone=max(0.0, float(repulsive_cfg.get("w_safe_zone", 10.0))),
+            w_collision_zone=max(0.0, float(repulsive_cfg.get("w_collision_zone", 100.0))),
+            safe_exponential_gain=max(0.0, float(repulsive_cfg.get("safe_exponential_gain", 10.0))),
+            safe_distance_shift=float(repulsive_cfg.get("safe_distance_shift", 1.5)),
+            collision_exponential_gain=max(0.0, float(repulsive_cfg.get("collision_exponential_gain", 6.0))),
+            collision_distance_shift=float(repulsive_cfg.get("collision_distance_shift", 1.5)),
+            max_braking_deceleration_mps2=max(
+                1e-6,
+                float(
+                    repulsive_cfg.get(
+                        "max_braking_deceleration_mps2",
+                        max(1e-6, abs(float(self.constraints.min_acceleration_mps2))),
+                    )
+                ),
+            ),
+            comfort_deceleration_mps2=max(
+                1e-6,
+                float(repulsive_cfg.get("comfort_deceleration_mps2", 2.0)),
+            ),
+            reaction_time_s=max(
+                0.0,
+                float(repulsive_cfg.get("reaction_time_s", 1.0)),
+            ),
+            static_longitudinal_buffer_m=max(
+                0.0,
+                float(repulsive_cfg.get("static_longitudinal_buffer_m", legacy_static_buffer_m)),
+            ),
+            static_lateral_buffer_m=max(
+                0.0,
+                float(repulsive_cfg.get("static_lateral_buffer_m", legacy_static_buffer_m)),
+            ),
+            shape_exponent=max(
+                2.0,
+                float(repulsive_cfg.get("shape_exponent", 4.0)),
+            ),
+            min_lateral_approach_speed_mps=max(
+                1e-6,
+                float(repulsive_cfg.get("min_lateral_approach_speed_mps", 0.1)),
+            ),
+            max_longitudinal_zone_length_m=max(
+                1e-6,
+                float(repulsive_cfg.get("max_longitudinal_zone_length_m", 10.0)),
+            ),
+            limit_lateral_zone_to_lane_width=bool(
+                repulsive_cfg.get("limit_lateral_zone_to_lane_width", True)
+            ),
+            max_lateral_zone_lane_fraction=max(
+                1e-3,
+                float(repulsive_cfg.get("max_lateral_zone_lane_fraction", 1.0)),
+            ),
+            project_hessian_psd=bool(repulsive_cfg.get("project_hessian_psd", repulsive_cfg.get("taylor_project_hessian_psd", True))),
+            min_hessian_eig=max(
+                0.0,
+                float(repulsive_cfg.get("min_hessian_eig", repulsive_cfg.get("taylor_min_hessian_eig", 1e-9))),
+            ),
+        )
+
+        lane_center_cfg = dict(cost_cfg.get("lane_center_follow", {}))
+        self.lane_center_follow_enabled = bool(lane_center_cfg.get("enabled", False))
+        self.lane_center_follow_weight = max(0.0, float(lane_center_cfg.get("w0", lane_center_cfg.get("w_lane_center", 0.0))))
+        self.lane_center_follow_xy_weight = max(
+            0.0,
+            float(
+                lane_center_cfg.get(
+                    "xy_w0",
+                    lane_center_cfg.get("w_xy", lane_center_cfg.get("centerline_xy_weight", 0.0)),
+                )
+            ),
+        )
+        self.lane_center_follow_qpsi = max(
+            0.0,
+            float(lane_center_cfg.get("q_psi", lane_center_cfg.get("heading_weight", 0.0))),
+        )
+        road_boundary_cfg = dict(cost_cfg.get("road_boundary", {}))
+        self.road_boundary_enabled = bool(road_boundary_cfg.get("enabled", True))
+        self.road_boundary_weight = max(
+            0.0,
+            float(
+                road_boundary_cfg.get(
+                    "w_boundary",
+                    road_boundary_cfg.get(
+                        "w_road",
+                        lane_center_cfg.get("w_boundary", lane_center_cfg.get("boundary_weight", 1.0e4)),
+                    ),
+                )
+            ),
+        )
+        configured_road_boundary_margin_m = max(
+            0.0,
+            float(road_boundary_cfg.get("margin_m", road_boundary_cfg.get("margin", 0.5))),
+        )
+        footprint_extra_margin_m = max(
+            0.0,
+            float(road_boundary_cfg.get("footprint_extra_margin_m", 0.2)),
+        )
+        footprint_margin_m = 0.5 * float(self.ego_width_m) + float(footprint_extra_margin_m)
+        self.road_boundary_margin_m = max(
+            float(configured_road_boundary_margin_m),
+            float(footprint_margin_m),
+        )
+        self.road_boundary_max_slack_m = max(
+            0.0,
+            float(road_boundary_cfg.get("max_slack_m", 0.25)),
+        )
+        self.lane_keep_boundary_weight = float(self.road_boundary_weight)
+        self.lane_keep_safe_region_alpha = min(
+            0.999999,
+            max(
+                1.0e-6,
+                float(
+                    lane_center_cfg.get(
+                        "safe_region_alpha",
+                        lane_center_cfg.get("alpha", 0.7),
+                    )
+                ),
+            ),
+        )
+        self.lane_center_reference_local_window = max(
+            0,
+            int(lane_center_cfg.get("local_stage_window", 2)),
+        )
+
+        self.reference_cfg = dict(mpc_cfg.get("reference_rollout", {}))
+        self.reference_heading_gain = float(self.reference_cfg.get("heading_gain", 1.6))
+        self.reference_speed_gain = float(self.reference_cfg.get("speed_gain", 1.2))
+        self.reference_prefer_lane_center_path = bool(self.reference_cfg.get("prefer_lane_center_path", True))
+        self.reference_path_los_heading_blend = min(
+            1.0,
+            max(0.0, float(self.reference_cfg.get("path_los_heading_blend", 0.35))),
+        )
+        self.reference_use_previous_solution_seed = bool(
+            self.reference_cfg.get("use_previous_solution_seed", True)
+        )
+        self.reference_consecutive_solver_failure_reset_threshold = max(
+            0,
+            int(
+                self.reference_cfg.get(
+                    "consecutive_solver_failure_reset_threshold",
+                    self.reference_cfg.get("failed_solution_reset_threshold", 4),
+                )
+            ),
+        )
+        self.fail_safe_gentle_brake_deceleration_mps2 = max(
+            1e-6,
+            float(
+                self.reference_cfg.get(
+                    "fail_safe_gentle_brake_deceleration_mps2", 2.0
+                )
+            ),
+        )
+        self.fail_safe_emergency_stop_failure_threshold = max(
+            1,
+            int(
+                self.reference_cfg.get(
+                    "fail_safe_emergency_stop_failure_threshold",
+                    max(1, int(self.reference_consecutive_solver_failure_reset_threshold)) * 2,
+                )
+            ),
+        )
+        self.reference_previous_solution_search_steps = max(
+            0,
+            int(self.reference_cfg.get("previous_solution_search_steps", 15)),
+        )
+        self.reference_previous_solution_max_position_error_m = max(
+            0.0,
+            float(self.reference_cfg.get("previous_solution_max_position_error_m", 3.0)),
+        )
+        self.reference_previous_solution_max_heading_error_rad = max(
+            0.0,
+            float(self.reference_cfg.get("previous_solution_max_heading_error_rad", 0.75)),
+        )
+        self.reference_previous_solution_max_speed_error_mps = max(
+            0.0,
+            float(self.reference_cfg.get("previous_solution_max_speed_error_mps", 4.0)),
+        )
+        self.reference_sequential_iterations = max(
+            1,
+            int(self.reference_cfg.get("sequential_linearization_iterations", 2)),
+        )
+        self.reference_obstacle_aware_speed_enabled = bool(
+            self.reference_cfg.get("obstacle_aware_speed_enabled", True)
+        )
+        self.reference_obstacle_check_horizon_s = max(
+            float(self.dt_s),
+            float(self.reference_cfg.get("obstacle_check_horizon_s", 3.0)),
+        )
+        self.reference_lead_obstacle_trigger_distance_m = max(
+            0.0,
+            float(self.reference_cfg.get("lead_obstacle_trigger_distance_m", 18.0)),
+        )
+        self.reference_lead_obstacle_lateral_margin_m = max(
+            0.0,
+            float(self.reference_cfg.get("lead_obstacle_lateral_margin_m", 1.2)),
+        )
+        self.reference_lead_obstacle_stop_buffer_m = max(
+            0.0,
+            float(self.reference_cfg.get("lead_obstacle_stop_buffer_m", 6.0)),
+        )
+        self.reference_lead_obstacle_braking_decel_mps2 = max(
+            1e-6,
+            float(
+                self.reference_cfg.get(
+                    "lead_obstacle_braking_deceleration_mps2",
+                    max(1e-6, abs(float(self.constraints.min_acceleration_mps2))),
+                )
+            ),
+        )
+        self.mode_cost_profiles = dict(
+            mpc_cfg.get("mode_cost_profiles", mpc_cfg.get("mpc_profiles", {}))
+        )
+        self.mode_cost_profile_blend_alpha = min(
+            1.0,
+            max(0.0, float(mpc_cfg.get("mode_cost_profile_blend_alpha", 0.35))),
+        )
+        self._base_mode_cost_state = self._capture_mode_cost_state()
+        self.active_cost_profile_name = "base"
+
+        self.solver_cfg = dict(mpc_cfg.get("solver", {}))
+        self.qp_max_iter = int(self.solver_cfg.get("max_iter", 4000))
+        self.qp_eps_abs = float(self.solver_cfg.get("eps_abs", 1e-3))
+        self.qp_eps_rel = float(self.solver_cfg.get("eps_rel", 1e-3))
+        self.qp_polish = bool(self.solver_cfg.get("polish", True))
+        if not _OSQP_AVAILABLE:
+            raise ImportError("OSQP is required for the MPC QP solver. Install `osqp` in the environment.")
+
+        self.nx = 4
+        self.nu = 2
+        self._last_status = "not_solved"
+        self._last_solve_time_ms = 0.0
+        self._last_active_max_velocity_mps = float(self.constraints.max_velocity_mps)
+        self._last_cost_terms: Dict[str, float] = {
+            "Cost_ref": 0.0,
+            "Cost_LaneCenter": 0.0,
+            "Cost_CenterlineXY": 0.0,
+            "Cost_RoadBoundary": 0.0,
+            "Cost_LaneBoundary": 0.0,
+            "Cost_Lane": 0.0,
+            "Cost_Repulsive_Safe": 0.0,
+            "Cost_Repulsive_Collision": 0.0,
+            "Cost_Repulsive": 0.0,
+            "Cost_Control": 0.0,
+        }
+        self._last_lane_keeping_profile = LaneKeepingProfile(stage_metrics=tuple(), total_cost=0.0)
+        self._last_x_solution: np.ndarray | None = None
+        self._last_u_solution: np.ndarray | None = None
+        self._previous_x_solution: np.ndarray | None = None
+        self._previous_u_solution: np.ndarray | None = None
+        self._consecutive_solver_failure_count: int = 0
+        self._last_failure_reset_triggered: bool = False
+        # Track whether the previous plan_trajectory call was a stop goal.
+        # Used to detect the stop→resume transition and prevent the v=0 stop
+        # plan from being reused as a linearisation seed, which would cause a
+        # degenerate QP and prevent re-acceleration after a stop.
+        self._last_was_stop_goal: bool = False
+
+        # --- Internal replan rate-limiting ---
+        self._last_replan_sim_time_s: float = -1.0
+
+    def _capture_mode_cost_state(self) -> Dict[str, float]:
+        return {
+            "w_attractive": float(self.safety_cost.w_safe),
+            "q_x": float(self.comfort_cost.qx),
+            "q_y": float(self.comfort_cost.qy),
+            "q_v": float(self.comfort_cost.qv),
+            "q_psi": float(self.comfort_cost.qpsi),
+            "w_control": float(self.comfort_cost.w_comf),
+            "q_a": float(self.comfort_cost.qa),
+            "q_delta": float(self.comfort_cost.qdelta),
+            "lane_center_w0": float(self.lane_center_follow_weight),
+            "lane_center_xy_w0": float(self.lane_center_follow_xy_weight),
+            "lane_center_q_psi": float(self.lane_center_follow_qpsi),
+            "road_boundary_w": float(self.road_boundary_weight),
+            "road_boundary_margin_m": float(self.road_boundary_margin_m),
+            "road_boundary_max_slack_m": float(self.road_boundary_max_slack_m),
+        }
+
+    @staticmethod
+    def _profile_value(profile: Mapping[str, object], *keys: str) -> float | None:
+        for key in keys:
+            if key in profile:
+                try:
+                    value = float(profile.get(key, 0.0))
+                except Exception:
+                    return None
+                if math.isfinite(value):
+                    return float(value)
+        return None
+
+    def _target_mode_cost_state(self, profile_name: str) -> Dict[str, float]:
+        target = dict(self._base_mode_cost_state)
+        raw_profile = self.mode_cost_profiles.get(str(profile_name), {})
+        if not isinstance(raw_profile, Mapping):
+            return target
+        aliases = {
+            "w_attractive": ("w_attractive", "w_safe"),
+            "q_x": ("q_x", "qx"),
+            "q_y": ("q_y", "qy"),
+            "q_v": ("q_v", "qv"),
+            "q_psi": ("q_psi", "qpsi"),
+            "w_control": ("w_control", "w_comf"),
+            "q_a": ("q_a", "qa"),
+            "q_delta": ("q_delta", "qdelta"),
+            "lane_center_w0": ("lane_center_w0", "lane_center_weight", "w_lane_center", "w0"),
+            "lane_center_xy_w0": (
+                "lane_center_xy_w0",
+                "lane_center_xy_weight",
+                "centerline_xy_weight",
+                "xy_w0",
+                "w_xy",
+            ),
+            "lane_center_q_psi": ("lane_center_q_psi", "lane_center_heading_weight"),
+            "road_boundary_w": ("road_boundary_w", "road_boundary_weight", "w_boundary"),
+            "road_boundary_margin_m": ("road_boundary_margin_m", "road_boundary_margin"),
+            "road_boundary_max_slack_m": ("road_boundary_max_slack_m", "road_boundary_max_slack"),
+        }
+        for canonical_key, key_aliases in aliases.items():
+            value = self._profile_value(raw_profile, *key_aliases)
+            if value is not None:
+                target[canonical_key] = max(0.0, float(value))
+        return target
+
+    def apply_mode_cost_profile(self, profile_name: str, blend_alpha: float | None = None) -> str:
+        """Apply behavior-mode-specific MPC cost weights.
+
+        Only objective weights are changed here; hard constraints stay under
+        the existing speed-cap/constraint layer so mode switching does not
+        suddenly alter feasibility.
+        """
+        normalized_profile = str(profile_name or "base").strip()
+        if not normalized_profile:
+            normalized_profile = "base"
+        if normalized_profile != "base" and normalized_profile not in self.mode_cost_profiles:
+            normalized_profile = "lane_follow" if "lane_follow" in self.mode_cost_profiles else "base"
+
+        target = self._target_mode_cost_state(normalized_profile)
+        alpha = (
+            float(self.mode_cost_profile_blend_alpha)
+            if blend_alpha is None
+            else float(blend_alpha)
+        )
+        alpha = min(1.0, max(0.0, float(alpha)))
+        current = self._capture_mode_cost_state()
+        blended = {
+            key: float(current.get(key, 0.0)) * (1.0 - alpha) + float(target[key]) * alpha
+            for key in target.keys()
+        }
+        self.safety_cost.w_safe = float(blended["w_attractive"])
+        self.comfort_cost.qx = float(blended["q_x"])
+        self.comfort_cost.qy = float(blended["q_y"])
+        self.comfort_cost.qv = float(blended["q_v"])
+        self.comfort_cost.qpsi = float(blended["q_psi"])
+        self.comfort_cost.w_comf = float(blended["w_control"])
+        self.comfort_cost.qa = float(blended["q_a"])
+        self.comfort_cost.qdelta = float(blended["q_delta"])
+        self.lane_center_follow_weight = float(blended["lane_center_w0"])
+        self.lane_center_follow_xy_weight = float(blended["lane_center_xy_w0"])
+        self.lane_center_follow_qpsi = float(blended["lane_center_q_psi"])
+        self.road_boundary_weight = float(blended["road_boundary_w"])
+        self.lane_keep_boundary_weight = float(self.road_boundary_weight)
+        self.road_boundary_margin_m = float(blended["road_boundary_margin_m"])
+        self.road_boundary_max_slack_m = float(blended["road_boundary_max_slack_m"])
+        self.active_cost_profile_name = str(normalized_profile)
+        return str(normalized_profile)
+
+    def should_replan(self, sim_time_s: float) -> bool:
+        """Return True when enough simulation time has elapsed for a new plan.
+
+        This keeps the replan-rate logic inside the MPC module so every
+        scenario runner gets the same behaviour without duplicating the
+        timing check.
+        """
+        if self._last_replan_sim_time_s < 0.0:
+            return True
+        return (float(sim_time_s) - self._last_replan_sim_time_s) >= self.trajectory_generation_period_s - 1e-9
+
+    def mark_replanned(self, sim_time_s: float) -> None:
+        """Record that a replan just happened at *sim_time_s*."""
+        self._last_replan_sim_time_s = float(sim_time_s)
+
+    @staticmethod
+    def _clamp(value: float, lower: float, upper: float) -> float:
+        return max(lower, min(upper, value))
+
+    @staticmethod
+    def _wrap_angle(angle_rad: float) -> float:
+        return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _align_angle_near(self, angle_rad: float, around_rad: float) -> float:
+        """
+        Return the angle equivalent to `angle_rad` that is closest to `around_rad`.
+
+        This keeps quadratic heading tracking terms consistent near the wrap
+        boundary at +/-pi.
+        """
+
+        return float(around_rad) + float(self._wrap_angle(float(angle_rad) - float(around_rad)))
+
+    def _normalized_lane_reference_sample_dict(
+        self,
+        sample: Mapping[str, object],
+    ) -> Dict[str, float] | None:
+        if not {"x_ref_m", "y_ref_m", "heading_rad"}.issubset(sample.keys()):
+            return None
+        default_lane_width_m = float(getattr(self, "lane_width_m", 4.0))
+        lane_width_m = float(sample.get("lane_width_m", default_lane_width_m))
+        if not math.isfinite(lane_width_m) or lane_width_m <= 0.0:
+            lane_width_m = float(default_lane_width_m)
+        fallback_half_width_m = 0.5 * float(lane_width_m)
+
+        road_center_offset_m = float(sample.get("road_center_offset_m", 0.0))
+        if not math.isfinite(road_center_offset_m):
+            road_center_offset_m = 0.0
+        road_left_width_m = float(sample.get("road_left_width_m", fallback_half_width_m))
+        if not math.isfinite(road_left_width_m) or road_left_width_m <= 0.0:
+            road_left_width_m = float(fallback_half_width_m)
+        road_right_width_m = float(sample.get("road_right_width_m", fallback_half_width_m))
+        if not math.isfinite(road_right_width_m) or road_right_width_m <= 0.0:
+            road_right_width_m = float(fallback_half_width_m)
+
+        return {
+            "x_ref_m": float(sample.get("x_ref_m", 0.0)),
+            "y_ref_m": float(sample.get("y_ref_m", 0.0)),
+            "heading_rad": float(sample.get("heading_rad", 0.0)),
+            "lane_id": int(sample.get("lane_id", 0)),
+            "lane_width_m": float(lane_width_m),
+            "road_center_offset_m": float(road_center_offset_m),
+            "road_left_width_m": float(road_left_width_m),
+            "road_right_width_m": float(road_right_width_m),
+        }
+
+    @staticmethod
+    def _blend_heading_angles(path_heading_rad: float, los_heading_rad: float, los_weight: float) -> float:
+        los_weight = min(1.0, max(0.0, float(los_weight)))
+        path_weight = 1.0 - los_weight
+        blended_x = path_weight * math.cos(float(path_heading_rad)) + los_weight * math.cos(float(los_heading_rad))
+        blended_y = path_weight * math.sin(float(path_heading_rad)) + los_weight * math.sin(float(los_heading_rad))
+        if math.hypot(blended_x, blended_y) <= 1e-12:
+            return float(path_heading_rad)
+        return float(math.atan2(blended_y, blended_x))
+
+    def _get_lane_center_stage_sample(
+        self,
+        lane_center_reference: Sequence[Mapping[str, object]] | None,
+        stage_index: int,
+        query_x_m: float | None = None,
+        query_y_m: float | None = None,
+    ) -> Dict[str, float] | None:
+        """
+        Fetch the normalized lane-reference sample for stage k.
+
+        Behavior:
+            - Default: returns the stage-indexed lane-center sample.
+            - If `query_x_m` and `query_y_m` are provided, returns the closest
+              available lane-center waypoint to that query point. This is used
+              in scenario4 so each MPC stage aligns with the nearest lane-center
+              waypoint to the stage reference trajectory point.
+        """
+
+        if lane_center_reference is None or len(lane_center_reference) == 0:
+            return None
+
+        valid_samples: List[Dict[str, float]] = []
+        for sample in lane_center_reference:
+            if not isinstance(sample, Mapping):
+                continue
+            normalized_sample = self._normalized_lane_reference_sample_dict(sample)
+            if normalized_sample is not None:
+                valid_samples.append(normalized_sample)
+
+        if len(valid_samples) == 0:
+            return None
+
+        idx = max(0, min(int(stage_index), len(valid_samples) - 1))
+
+        # Query-aware mode: keep the search local to the requested stage so the
+        # reference cannot jump far ahead/back on tight curves.
+        if query_x_m is not None and query_y_m is not None:
+            qx = float(query_x_m)
+            qy = float(query_y_m)
+            window_radius = max(0, int(getattr(self, "lane_center_reference_local_window", 0)))
+            start_idx = max(0, int(idx) - int(window_radius))
+            stop_idx = min(len(valid_samples), int(idx) + int(window_radius) + 1)
+            candidate_samples = valid_samples[start_idx:stop_idx] if stop_idx > start_idx else [valid_samples[idx]]
+            best = min(
+                candidate_samples,
+                key=lambda sample: math.hypot(
+                    float(sample.get("x_ref_m", 0.0)) - qx,
+                    float(sample.get("y_ref_m", 0.0)) - qy,
+                ),
+            )
+            return dict(best)
+
+        sample = valid_samples[idx]
+        return dict(sample)
+
+    def _get_lane_center_stage_ref(
+        self,
+        lane_center_reference: Sequence[Mapping[str, object]] | None,
+        stage_index: int,
+        query_x_m: float | None = None,
+        query_y_m: float | None = None,
+    ) -> Tuple[float, float, float] | None:
+        """Backward-compatible tuple view of the lane-reference sample."""
+
+        sample = self._get_lane_center_stage_sample(
+            lane_center_reference=lane_center_reference,
+            stage_index=int(stage_index),
+            query_x_m=query_x_m,
+            query_y_m=query_y_m,
+        )
+        if sample is None:
+            return None
+        return (
+            float(sample.get("x_ref_m", 0.0)),
+            float(sample.get("y_ref_m", 0.0)),
+            float(sample.get("heading_rad", 0.0)),
+        )
+    @staticmethod
+    def _lane_center_waypoint_position(waypoint: Mapping[str, object]) -> Tuple[float, float] | None:
+        position_raw = waypoint.get("position")
+        if not isinstance(position_raw, (list, tuple)) or len(position_raw) < 2:
+            return None
+        return float(position_raw[0]), float(position_raw[1])
+
+    @staticmethod
+    def _lane_center_waypoint_key(x_m: float, y_m: float) -> Tuple[float, float]:
+        return (round(float(x_m), 3), round(float(y_m), 3))
+
+    @staticmethod
+    def _nearest_progress_along_route(
+        route_points: Sequence[Sequence[float]],
+        xy: Sequence[float],
+    ) -> tuple[float, float]:
+        if len(route_points) <= 1:
+            return 0.0, 0.0
+
+        total_progress_m = 0.0
+        best_progress_m = 0.0
+        best_distance_m = float("inf")
+        px_m = float(xy[0])
+        py_m = float(xy[1])
+
+        for idx in range(len(route_points) - 1):
+            x0_m, y0_m = float(route_points[idx][0]), float(route_points[idx][1])
+            x1_m, y1_m = float(route_points[idx + 1][0]), float(route_points[idx + 1][1])
+            dx_m = x1_m - x0_m
+            dy_m = y1_m - y0_m
+            seg_len_sq = dx_m * dx_m + dy_m * dy_m
+            if seg_len_sq <= 1e-9:
+                continue
+            proj = ((px_m - x0_m) * dx_m + (py_m - y0_m) * dy_m) / seg_len_sq
+            proj = min(1.0, max(0.0, proj))
+            cx_m = x0_m + proj * dx_m
+            cy_m = y0_m + proj * dy_m
+            distance_m = math.hypot(px_m - cx_m, py_m - cy_m)
+            if distance_m < best_distance_m:
+                best_distance_m = distance_m
+                best_progress_m = total_progress_m + proj * math.sqrt(seg_len_sq)
+            total_progress_m += math.sqrt(seg_len_sq)
+        return best_progress_m, total_progress_m
+
+    @staticmethod
+    def _sample_route_at_progress(
+        route_points: Sequence[Sequence[float]],
+        progress_m: float,
+    ) -> Tuple[float, float, float]:
+        if len(route_points) == 0:
+            return 0.0, 0.0, 0.0
+        if len(route_points) == 1:
+            return float(route_points[0][0]), float(route_points[0][1]), 0.0
+
+        remaining_m = max(0.0, float(progress_m))
+        for idx in range(len(route_points) - 1):
+            x0_m, y0_m = float(route_points[idx][0]), float(route_points[idx][1])
+            x1_m, y1_m = float(route_points[idx + 1][0]), float(route_points[idx + 1][1])
+            segment_length_m = math.hypot(x1_m - x0_m, y1_m - y0_m)
+            if segment_length_m <= 1e-9:
+                continue
+            if remaining_m <= segment_length_m:
+                alpha = remaining_m / segment_length_m
+                heading_rad = math.atan2(y1_m - y0_m, x1_m - x0_m)
+                return (
+                    float(x0_m + alpha * (x1_m - x0_m)),
+                    float(y0_m + alpha * (y1_m - y0_m)),
+                    float(heading_rad),
+                )
+            remaining_m -= segment_length_m
+
+        last_idx = len(route_points) - 1
+        prev_idx = max(0, last_idx - 1)
+        heading_rad = math.atan2(
+            float(route_points[last_idx][1]) - float(route_points[prev_idx][1]),
+            float(route_points[last_idx][0]) - float(route_points[prev_idx][0]),
+        )
+        return (
+            float(route_points[last_idx][0]),
+            float(route_points[last_idx][1]),
+            float(heading_rad),
+        )
+
+    def _build_route_reference(
+        self,
+        current_state: np.ndarray,
+        destination_state: np.ndarray,
+        route_reference_points: Sequence[Sequence[float]] | None,
+        destination_lane_id: int | None = None,
+    ) -> List[Dict[str, float]]:
+        if route_reference_points is None or len(route_reference_points) < 2:
+            return []
+
+        start_progress_m, route_length_m = self._nearest_progress_along_route(
+            route_points=route_reference_points,
+            xy=[float(current_state[0]), float(current_state[1])],
+        )
+        reference_speed_mps = max(
+            1.0,
+            float(current_state[2]),
+            abs(float(destination_state[2])),
+        )
+        step_distance_m = max(0.5, float(reference_speed_mps) * float(self.dt_s))
+
+        stage_reference: List[Dict[str, float]] = []
+        for k in range(self.horizon_steps + 1):
+            progress_m = min(float(route_length_m), float(start_progress_m) + float(k) * float(step_distance_m))
+            x_ref_m, y_ref_m, heading_rad = self._sample_route_at_progress(
+                route_points=route_reference_points,
+                progress_m=float(progress_m),
+            )
+            stage_reference.append(
+                {
+                    "x_ref_m": float(x_ref_m),
+                    "y_ref_m": float(y_ref_m),
+                    "heading_rad": float(heading_rad),
+                    "lane_id": int(destination_lane_id if destination_lane_id is not None else -1),
+                    "lane_width_m": float(self.lane_width_m),
+                    "road_center_offset_m": 0.0,
+                    "road_left_width_m": 0.5 * float(self.lane_width_m),
+                    "road_right_width_m": 0.5 * float(self.lane_width_m),
+                }
+            )
+        return stage_reference
+
+    def _build_lane_center_reference(
+        self,
+        current_state: np.ndarray,
+        destination_state: np.ndarray,
+        lane_center_waypoints: Sequence[Mapping[str, object]] | None,
+        destination_lane_id: int | None = None,
+    ) -> List[Dict[str, float]]:
+        """
+        Build per-stage lane-center reference inside MPC.
+
+        The integration layer provides road/lane waypoints. MPC owns the
+        lane-keeping cost and the reference chain used by that cost.
+        """
+
+        if lane_center_waypoints is None or len(lane_center_waypoints) == 0:
+            return []
+
+        x_ego_m = float(current_state[0])
+        y_ego_m = float(current_state[1])
+        x_target_m = float(destination_state[0])
+        y_target_m = float(destination_state[1])
+
+        valid_waypoints: List[Dict[str, object]] = []
+        waypoint_by_xy: Dict[Tuple[float, float], Dict[str, object]] = {}
+        for waypoint in lane_center_waypoints:
+            if not isinstance(waypoint, Mapping):
+                continue
+            position = self._lane_center_waypoint_position(waypoint)
+            if position is None:
+                continue
+            waypoint_copy = dict(waypoint)
+            waypoint_copy["heading_rad"] = float(waypoint_copy.get("heading_rad", 0.0))
+            waypoint_key = self._lane_center_waypoint_key(position[0], position[1])
+            waypoint_by_xy[waypoint_key] = waypoint_copy
+            valid_waypoints.append(waypoint_copy)
+
+        if len(valid_waypoints) == 0:
+            return []
+
+        normalized_destination_lane_id = (
+            None
+            if destination_lane_id is None
+            else int(destination_lane_id)
+        )
+        if normalized_destination_lane_id is not None:
+            target_lane_waypoints = [
+                waypoint
+                for waypoint in valid_waypoints
+                if int(waypoint.get("lane_id", 0)) == int(normalized_destination_lane_id)
+                and self._lane_center_waypoint_position(waypoint) is not None
+            ]
+        else:
+            target_lane_waypoints = []
+
+        if len(target_lane_waypoints) == 0:
+            target_lane_waypoint = min(
+                valid_waypoints,
+                key=lambda waypoint: math.hypot(
+                    float(self._lane_center_waypoint_position(waypoint)[0]) - x_target_m,
+                    float(self._lane_center_waypoint_position(waypoint)[1]) - y_target_m,
+                ) if self._lane_center_waypoint_position(waypoint) is not None else 1.0e9,
+            )
+            target_lane_id = int(target_lane_waypoint.get("lane_id", 0))
+            target_lane_waypoints = [
+                waypoint
+                for waypoint in valid_waypoints
+                if int(waypoint.get("lane_id", 0)) == target_lane_id
+                and self._lane_center_waypoint_position(waypoint) is not None
+            ]
+            if len(target_lane_waypoints) == 0:
+                target_lane_waypoints = valid_waypoints
+        else:
+            target_lane_id = int(normalized_destination_lane_id)
+
+        destination_anchor_waypoint = min(
+            target_lane_waypoints,
+            key=lambda waypoint: math.hypot(
+                float(self._lane_center_waypoint_position(waypoint)[0]) - x_target_m,
+                float(self._lane_center_waypoint_position(waypoint)[1]) - y_target_m,
+            ) if self._lane_center_waypoint_position(waypoint) is not None else 1.0e9,
+        )
+        destination_anchor_position = self._lane_center_waypoint_position(destination_anchor_waypoint)
+        destination_anchor_key = (
+            None
+            if destination_anchor_position is None
+            else self._lane_center_waypoint_key(
+                float(destination_anchor_position[0]),
+                float(destination_anchor_position[1]),
+            )
+        )
+
+        forward_target_lane_waypoints = []
+        for waypoint in target_lane_waypoints:
+            position = self._lane_center_waypoint_position(waypoint)
+            if position is None:
+                continue
+            longitudinal_offset_m = (
+                math.cos(float(waypoint.get("heading_rad", 0.0))) * (float(position[0]) - x_ego_m)
+                + math.sin(float(waypoint.get("heading_rad", 0.0))) * (float(position[1]) - y_ego_m)
+            )
+            if longitudinal_offset_m >= -1e-6:
+                forward_target_lane_waypoints.append(waypoint)
+        seed_candidates = (
+            forward_target_lane_waypoints
+            if len(forward_target_lane_waypoints) > 0
+            else target_lane_waypoints
+        )
+        current_waypoint = min(
+            seed_candidates,
+            key=lambda waypoint: math.hypot(
+                float(self._lane_center_waypoint_position(waypoint)[0]) - x_ego_m,
+                float(self._lane_center_waypoint_position(waypoint)[1]) - y_ego_m,
+            ) if self._lane_center_waypoint_position(waypoint) is not None else 1.0e9,
+        )
+
+        stage_reference: List[Dict[str, float]] = []
+        visited_keys: set[Tuple[float, float]] = set()
+        for _k in range(self.horizon_steps + 1):
+            current_position = self._lane_center_waypoint_position(current_waypoint)
+            if current_position is None:
+                break
+            lane_width_m = float(current_waypoint.get("lane_width_m", self.lane_width_m))
+            if not math.isfinite(lane_width_m) or lane_width_m <= 0.0:
+                lane_width_m = float(self.lane_width_m)
+            stage_reference.append(
+                {
+                    "x_ref_m": float(current_position[0]),
+                    "y_ref_m": float(current_position[1]),
+                    "heading_rad": float(current_waypoint.get("heading_rad", 0.0)),
+                    "lane_id": int(target_lane_id),
+                    "lane_width_m": float(lane_width_m),
+                    "road_center_offset_m": float(current_waypoint.get("road_center_offset_m", 0.0)),
+                    "road_left_width_m": float(current_waypoint.get("road_left_width_m", 0.5 * lane_width_m)),
+                    "road_right_width_m": float(current_waypoint.get("road_right_width_m", 0.5 * lane_width_m)),
+                }
+            )
+
+            current_key = self._lane_center_waypoint_key(
+                float(current_position[0]),
+                float(current_position[1]),
+            )
+            if destination_anchor_key is not None and current_key == destination_anchor_key:
+                break
+
+            next_position_raw = current_waypoint.get("next", None)
+            if not isinstance(next_position_raw, (list, tuple)) or len(next_position_raw) < 2:
+                break
+            next_key = self._lane_center_waypoint_key(float(next_position_raw[0]), float(next_position_raw[1]))
+            if next_key in visited_keys:
+                break
+            visited_keys.add(next_key)
+            next_waypoint = waypoint_by_xy.get(next_key)
+            if next_waypoint is None:
+                break
+            current_waypoint = next_waypoint
+
+        if len(stage_reference) == 0:
+            return []
+        while len(stage_reference) < self.horizon_steps + 1:
+            stage_reference.append(dict(stage_reference[-1]))
+        return stage_reference
+
+    def _normalize_lane_center_reference_samples(
+        self,
+        lane_center_reference_samples: Sequence[Mapping[str, object]] | None,
+    ) -> List[Dict[str, float]]:
+        if lane_center_reference_samples is None:
+            return []
+
+        normalized: List[Dict[str, float]] = []
+        for sample in lane_center_reference_samples:
+            if not isinstance(sample, Mapping):
+                continue
+            normalized_sample = self._normalized_lane_reference_sample_dict(sample)
+            if normalized_sample is not None:
+                normalized.append(normalized_sample)
+
+        if len(normalized) == 0:
+            return []
+        while len(normalized) < self.horizon_steps + 1:
+            normalized.append(dict(normalized[-1]))
+        return normalized[: self.horizon_steps + 1]
+
+    def _get_object_state_at_stage(
+        self,
+        object_snapshot: Mapping[str, object],
+        stage_index: int,
+        dt_s: float,
+    ) -> List[float]:
+        """
+        Return obstacle state [x,y,v,psi] at prediction stage using tracker
+        prediction if available, otherwise constant-velocity propagation.
+        """
+
+        predicted = object_snapshot.get("predicted_trajectory", object_snapshot.get("future_trajectory", []))
+        if isinstance(predicted, Sequence) and 0 <= int(stage_index) < len(predicted):
+            state = predicted[int(stage_index)]
+            if isinstance(state, Sequence) and len(state) >= 4:
+                return [float(state[0]), float(state[1]), float(state[2]), float(state[3])]
+
+        x = float(object_snapshot.get("x", 0.0))
+        y = float(object_snapshot.get("y", 0.0))
+        v = float(object_snapshot.get("v", 0.0))
+        psi = float(object_snapshot.get("psi", 0.0))
+        t = float(max(0, int(stage_index) + 1)) * float(dt_s)
+        return [
+            float(x + v * math.cos(psi) * t),
+            float(y + v * math.sin(psi) * t),
+            float(v),
+            float(psi),
+        ]
+
+    def _build_shifted_previous_solution_seed(self, x0: np.ndarray) -> Tuple[np.ndarray, np.ndarray] | None:
+        """
+        Reuse the previous solved MPC trajectory as the next linearization seed.
+
+        The current ego state is matched to a nearby stage of the previous
+        solution, then the remainder of that solution is shifted forward.
+        """
+
+        if not bool(self.reference_use_previous_solution_seed):
+            return None
+        if self._previous_x_solution is None or self._previous_u_solution is None:
+            return None
+
+        prev_x = self._previous_x_solution
+        prev_u = self._previous_u_solution
+        if prev_x.shape != (self.horizon_steps + 1, self.nx):
+            return None
+        if prev_u.shape != (self.horizon_steps, self.nu):
+            return None
+
+        search_limit = min(
+            int(self.reference_previous_solution_search_steps),
+            prev_x.shape[0] - 1,
+        )
+        best_idx: int | None = None
+        best_score = float("inf")
+
+        for idx in range(search_limit + 1):
+            position_error_m = math.hypot(
+                float(prev_x[idx, 0]) - float(x0[0]),
+                float(prev_x[idx, 1]) - float(x0[1]),
+            )
+            heading_error_rad = abs(self._wrap_angle(float(prev_x[idx, 3]) - float(x0[3])))
+            speed_error_mps = abs(float(prev_x[idx, 2]) - float(x0[2]))
+            if position_error_m > float(self.reference_previous_solution_max_position_error_m):
+                continue
+            if heading_error_rad > float(self.reference_previous_solution_max_heading_error_rad):
+                continue
+            if speed_error_mps > float(self.reference_previous_solution_max_speed_error_mps):
+                continue
+
+            score = position_error_m + 0.5 * heading_error_rad + 0.25 * speed_error_mps
+            if score < best_score:
+                best_score = float(score)
+                best_idx = int(idx)
+
+        if best_idx is None:
+            return None
+
+        x_seed = np.zeros_like(prev_x)
+        u_seed = np.zeros_like(prev_u)
+        x_seed[0] = np.asarray(x0, dtype=float)
+
+        for k in range(1, self.horizon_steps + 1):
+            src_idx = min(best_idx + k, prev_x.shape[0] - 1)
+            x_seed[k] = np.asarray(prev_x[src_idx], dtype=float)
+            x_seed[k, 3] = self._wrap_angle(float(x_seed[k, 3]))
+
+        for k in range(self.horizon_steps):
+            src_idx = min(best_idx + k, prev_u.shape[0] - 1)
+            u_seed[k] = np.asarray(prev_u[src_idx], dtype=float)
+
+        return x_seed, u_seed
+
+    def _compute_reference_rollout_speed_limit(
+        self,
+        stage_x_m: float,
+        stage_y_m: float,
+        stage_heading_rad: float,
+        stage_index: int,
+        base_speed_mps: float,
+        object_snapshots: Sequence[Mapping[str, object]],
+    ) -> float:
+        """
+        Obstacle-aware speed heuristic for rollout generation.
+
+        The rollout stays generic: if a lead obstacle is predicted ahead in the
+        same corridor, cap the rollout speed to a simple stopping-speed bound.
+        """
+
+        base_speed_mps = max(0.0, float(base_speed_mps))
+        if not bool(self.reference_obstacle_aware_speed_enabled):
+            return float(base_speed_mps)
+        if base_speed_mps <= 0.0:
+            return 0.0
+        if len(object_snapshots) == 0:
+            return float(base_speed_mps)
+        if float(stage_index) * float(self.dt_s) > float(self.reference_obstacle_check_horizon_s):
+            return float(base_speed_mps)
+
+        cos_heading = math.cos(float(stage_heading_rad))
+        sin_heading = math.sin(float(stage_heading_rad))
+        best_gap_m = float("inf")
+
+        for object_snapshot in object_snapshots:
+            obj_state = self._get_object_state_at_stage(
+                object_snapshot=object_snapshot,
+                stage_index=int(stage_index),
+                dt_s=float(self.dt_s),
+            )
+            obj_x_m = float(obj_state[0])
+            obj_y_m = float(obj_state[1])
+            dx_m = obj_x_m - float(stage_x_m)
+            dy_m = obj_y_m - float(stage_y_m)
+            along_track_m = dx_m * cos_heading + dy_m * sin_heading
+            cross_track_m = -dx_m * sin_heading + dy_m * cos_heading
+
+            if along_track_m < 0.0:
+                continue
+            if along_track_m > float(self.reference_lead_obstacle_trigger_distance_m):
+                continue
+
+            obj_half_width_m = 0.5 * float(object_snapshot.get("width_m", 2.0))
+            lateral_limit_m = obj_half_width_m + float(self.reference_lead_obstacle_lateral_margin_m)
+            if abs(cross_track_m) > lateral_limit_m:
+                continue
+
+            best_gap_m = min(float(best_gap_m), float(along_track_m))
+
+        if not math.isfinite(best_gap_m):
+            return float(base_speed_mps)
+
+        remaining_gap_m = max(0.0, float(best_gap_m) - float(self.reference_lead_obstacle_stop_buffer_m))
+        stop_speed_limit_mps = math.sqrt(
+            max(
+                0.0,
+                2.0 * float(self.reference_lead_obstacle_braking_decel_mps2) * remaining_gap_m,
+            )
+        )
+        return float(min(base_speed_mps, stop_speed_limit_mps))
+
+    def _superellipsoid_obstacle_cost_components(
+        self,
+        ego_state: Sequence[float],
+        obstacle_state: Sequence[float],
+        obstacle_length_m: float,
+        obstacle_width_m: float,
+    ) -> Tuple[float, float]:
+        """
+        Super-ellipsoid obstacle cost components.
+
+        Cost:
+            J_obs = w_c * exp(-k_c * (r_c - s_c))
+
+        where:
+            r_c = normalized distance to the collision zone
+        """
+
+        geometry = self._superellipsoid_zone_geometry(
+            ego_state=ego_state,
+            obstacle_state=obstacle_state,
+            obstacle_length_m=obstacle_length_m,
+            obstacle_width_m=obstacle_width_m,
+        )
+        rc = float(geometry["rc"])
+        cost_collision = float(self.repulsive_cost.w_collision_zone) * math.exp(
+            -float(self.repulsive_cost.collision_exponential_gain)
+            * (float(rc) - float(self.repulsive_cost.collision_distance_shift))
+        )
+        return 0.0, float(cost_collision)
+
+    def _superellipsoid_zone_geometry(
+        self,
+        ego_state: Sequence[float],
+        obstacle_state: Sequence[float],
+        obstacle_length_m: float,
+        obstacle_width_m: float,
+    ) -> Dict[str, float]:
+        """
+        Return the active collision-zone geometry used by the live cost.
+
+        The returned values are aligned to the obstacle frame.
+        """
+
+        ego_x_m = float(ego_state[0]) if len(ego_state) >= 1 else 0.0
+        ego_y_m = float(ego_state[1]) if len(ego_state) >= 2 else 0.0
+
+        obs_x_m = float(obstacle_state[0]) if len(obstacle_state) >= 1 else 0.0
+        obs_y_m = float(obstacle_state[1]) if len(obstacle_state) >= 2 else 0.0
+        obs_psi_rad = float(obstacle_state[3]) if len(obstacle_state) >= 4 else 0.0
+
+        cos_obs = math.cos(float(obs_psi_rad))
+        sin_obs = math.sin(float(obs_psi_rad))
+        dx_m = float(ego_x_m) - float(obs_x_m)
+        dy_m = float(ego_y_m) - float(obs_y_m)
+        x_local_m = dx_m * cos_obs + dy_m * sin_obs
+        y_local_m = -dx_m * sin_obs + dy_m * cos_obs
+
+        obstacle_length_m = max(1e-6, float(obstacle_length_m))
+        obstacle_width_m = max(1e-6, float(obstacle_width_m))
+        x0_m = 0.5 * (
+            float(obstacle_length_m)
+            + float(self.repulsive_cost.static_longitudinal_buffer_m)
+        )
+        y0_m = 0.5 * (
+            float(obstacle_width_m)
+            + float(self.repulsive_cost.static_lateral_buffer_m)
+        )
+        xc_m = max(1e-6, float(x0_m))
+        yc_m = max(1e-6, float(y0_m))
+
+        n = max(2.0, float(self.repulsive_cost.shape_exponent))
+        rc = (abs(float(x_local_m) / max(1e-6, float(xc_m))) ** n + abs(float(y_local_m) / max(1e-6, float(yc_m))) ** n) ** (1.0 / n)
+
+        return {
+            "x_local_m": float(x_local_m),
+            "y_local_m": float(y_local_m),
+            "x0_m": float(x0_m),
+            "y0_m": float(y0_m),
+            "xc_m": float(xc_m),
+            "yc_m": float(yc_m),
+            "xs_m": float(xc_m),
+            "ys_m": float(yc_m),
+            "shape_exponent": float(n),
+            "obstacle_x_m": float(obs_x_m),
+            "obstacle_y_m": float(obs_y_m),
+            "obstacle_psi_rad": float(obs_psi_rad),
+            "rc": float(rc),
+            "rs": float(rc),
+        }
+
+    def _superellipsoid_obstacle_cost(
+        self,
+        ego_state: Sequence[float],
+        obstacle_state: Sequence[float],
+        obstacle_length_m: float,
+        obstacle_width_m: float,
+    ) -> float:
+        cost_safe, cost_collision = self._superellipsoid_obstacle_cost_components(
+            ego_state=ego_state,
+            obstacle_state=obstacle_state,
+            obstacle_length_m=obstacle_length_m,
+            obstacle_width_m=obstacle_width_m,
+        )
+        return float(cost_safe + cost_collision)
+
+    def _superellipsoid_cost_taylor_terms(
+        self,
+        ego_state_ref: Sequence[float],
+        obstacle_state: Sequence[float],
+        obstacle_length_m: float,
+        obstacle_width_m: float,
+    ) -> Tuple[float, np.ndarray, np.ndarray]:
+        """
+        Numerical Taylor ingredients of the super-ellipsoid obstacle cost with
+        respect to ego state [x, y, v, psi] at one stage reference point.
+        """
+
+        state_ref = np.array(
+            [
+                float(ego_state_ref[0]) if len(ego_state_ref) >= 1 else 0.0,
+                float(ego_state_ref[1]) if len(ego_state_ref) >= 2 else 0.0,
+                float(ego_state_ref[2]) if len(ego_state_ref) >= 3 else 0.0,
+                self._wrap_angle(float(ego_state_ref[3]) if len(ego_state_ref) >= 4 else 0.0),
+            ],
+            dtype=float,
+        )
+        step_sizes = np.array([0.05, 0.05, 0.05, 0.01], dtype=float)
+
+        def evaluate(query_state: np.ndarray) -> float:
+            state_eval = np.asarray(query_state, dtype=float).copy()
+            state_eval[3] = self._wrap_angle(float(state_eval[3]))
+            return self._superellipsoid_obstacle_cost(
+                ego_state=state_eval,
+                obstacle_state=obstacle_state,
+                obstacle_length_m=float(obstacle_length_m),
+                obstacle_width_m=float(obstacle_width_m),
+            )
+
+        p0 = float(evaluate(state_ref))
+        gradient = np.zeros(4, dtype=float)
+        hessian = np.zeros((4, 4), dtype=float)
+
+        for idx in range(4):
+            delta = np.zeros(4, dtype=float)
+            delta[idx] = float(step_sizes[idx])
+            f_plus = float(evaluate(state_ref + delta))
+            f_minus = float(evaluate(state_ref - delta))
+            gradient[idx] = (f_plus - f_minus) / (2.0 * float(step_sizes[idx]))
+            hessian[idx, idx] = (f_plus - 2.0 * p0 + f_minus) / (float(step_sizes[idx]) ** 2)
+
+        for row in range(4):
+            for col in range(row + 1, 4):
+                delta_row = np.zeros(4, dtype=float)
+                delta_col = np.zeros(4, dtype=float)
+                delta_row[row] = float(step_sizes[row])
+                delta_col[col] = float(step_sizes[col])
+                f_pp = float(evaluate(state_ref + delta_row + delta_col))
+                f_pm = float(evaluate(state_ref + delta_row - delta_col))
+                f_mp = float(evaluate(state_ref - delta_row + delta_col))
+                f_mm = float(evaluate(state_ref - delta_row - delta_col))
+                mixed = (f_pp - f_pm - f_mp + f_mm) / (4.0 * float(step_sizes[row]) * float(step_sizes[col]))
+                hessian[row, col] = mixed
+                hessian[col, row] = mixed
+
+        hessian = 0.5 * (hessian + hessian.T)
+        return float(p0), np.asarray(gradient, dtype=float), np.asarray(hessian, dtype=float)
+
+    def _project_symmetric_hessian_to_psd(self, hessian: np.ndarray) -> np.ndarray:
+        """
+        Project a symmetric Hessian to PSD by clamping eigenvalues.
+
+        This keeps the local quadratic obstacle approximation convex for OSQP.
+        """
+
+        H = np.asarray(hessian, dtype=float)
+        H = 0.5 * (H + H.T)
+        eigvals, eigvecs = np.linalg.eigh(H)
+        eig_floor = float(self.repulsive_cost.min_hessian_eig)
+        eigvals_clamped = np.maximum(eigvals, eig_floor)
+        return np.asarray(eigvecs @ np.diag(eigvals_clamped) @ eigvecs.T, dtype=float)
+
+    def get_runtime_status(self) -> Dict[str, object]:
+        return {
+            "solver_status": str(self._last_status),
+            "solve_time_ms": float(self._last_solve_time_ms),
+            "horizon_steps": int(self.horizon_steps),
+            "plan_dt_s": float(self.dt_s),
+            "horizon_s": float(self.horizon_s),
+            "trajectory_generation_frequency_hz": float(self.trajectory_generation_frequency_hz),
+            "active_max_velocity_mps": float(self._last_active_max_velocity_mps),
+            "compute_backend": "cpu_osqp_qp",
+            "consecutive_solver_failure_count": int(self._consecutive_solver_failure_count),
+            "consecutive_solver_failure_reset_threshold": int(
+                self.reference_consecutive_solver_failure_reset_threshold
+            ),
+            "failure_reset_triggered": bool(self._last_failure_reset_triggered),
+        }
+
+    def get_last_cost_terms(self) -> Dict[str, float]:
+        """Return the most recently evaluated MPC cost terms."""
+
+        return dict(self._last_cost_terms)
+
+    def clear_previous_solution_seed(self) -> None:
+        """Drop any stored warm-start solution used for rollout seeding."""
+
+        self._previous_x_solution = None
+        self._previous_u_solution = None
+
+    def _clear_all_solution_memory(self) -> None:
+        self._last_x_solution = None
+        self._last_u_solution = None
+        self._previous_x_solution = None
+        self._previous_u_solution = None
+
+    def _record_solver_failure_state(self, solved: bool) -> bool:
+        if bool(solved):
+            self._consecutive_solver_failure_count = 0
+            self._last_failure_reset_triggered = False
+            return False
+
+        self._consecutive_solver_failure_count += 1
+        reset_threshold = int(self.reference_consecutive_solver_failure_reset_threshold)
+        should_reset = bool(
+            reset_threshold > 0
+            and int(self._consecutive_solver_failure_count) >= int(reset_threshold)
+        )
+        self._last_failure_reset_triggered = bool(should_reset)
+        return bool(should_reset)
+
+    def _record_clean_restart_result(self, solved: bool) -> None:
+        self._consecutive_solver_failure_count = 0 if bool(solved) else 1
+        self._last_was_stop_goal = False
+
+    def get_last_lane_keeping_diagnostics(self) -> Dict[str, object]:
+        """Return d_perp, U_lane, and J_lane for the last planned horizon."""
+
+        return self._last_lane_keeping_profile.as_dict()
+
+    def get_current_lateral_offset_m(self) -> float | None:
+        """Perpendicular distance from lane center at the ego's current position (stage-0 of last plan)."""
+        profile = self._last_lane_keeping_profile
+        if profile is None or len(profile.stage_metrics) == 0:
+            return None
+        return float(profile.stage_metrics[0].d_perp_m)
+
+    def get_current_heading_error_rad(self) -> float | None:
+        """Heading error (ego yaw minus lane reference heading) at the ego's current position."""
+        profile = self._last_lane_keeping_profile
+        x = self._last_x_solution
+        if profile is None or len(profile.stage_metrics) == 0 or x is None or x.shape[0] == 0:
+            return None
+        return float(self._wrap_angle(float(x[0, 3]) - float(profile.stage_metrics[0].lane_heading_rad)))
+
+    def get_last_control_sequence(self, max_steps: int | None = None) -> List[Dict[str, float]]:
+        """
+        Return the most recent MPC-planned control sequence.
+
+        This exposes the optimizer/fallback plan controls used for the latest
+        candidate trajectory generation. It does not return the applied ego
+        controls from the downstream PID tracker.
+        """
+
+        if self._last_u_solution is None:
+            return []
+
+        controls = np.asarray(self._last_u_solution, dtype=float)
+        step_limit = int(controls.shape[0])
+        if max_steps is not None:
+            step_limit = max(0, min(step_limit, int(max_steps)))
+
+        output: List[Dict[str, float]] = []
+        for step_idx in range(step_limit):
+            output.append(
+                {
+                    "step_index": int(step_idx),
+                    "time_from_plan_start_s": float(step_idx) * float(self.dt_s),
+                    "acceleration_mps2": float(controls[step_idx, 0]),
+                    "steering_angle_rad": float(controls[step_idx, 1]),
+                }
+            )
+        return output
+
+    def _normalize_destination_state(self, destination_state: Sequence[float]) -> np.ndarray:
+        """
+        Intent:
+            Normalize destination input to shape (4,) = [x,y,v,psi].
+
+        PDF rule implemented:
+            If destination provides only [x,y], default to v_ref = 0 and
+            psi_ref = 0.
+        """
+
+        if len(destination_state) >= 4:
+            x_ref = float(destination_state[0])
+            y_ref = float(destination_state[1])
+            v_ref = float(destination_state[2])
+            psi_ref = float(destination_state[3])
+            return np.array([x_ref, y_ref, v_ref, self._wrap_angle(psi_ref)], dtype=float)
+
+        if len(destination_state) >= 2:
+            x_ref = float(destination_state[0])
+            y_ref = float(destination_state[1])
+            v_ref = 0.0
+            psi_ref = 0.0
+            return np.array([x_ref, y_ref, v_ref, psi_ref], dtype=float)
+
+        raise ValueError("destination_state must have at least [x, y].")
+
+    def _compute_active_speed_upper_bound_mps(
+        self,
+        current_state: Sequence[float],
+        destination_state: Sequence[float],
+        force_stop_goal: bool = False,
+    ) -> float:
+        """
+        Compute the active speed upper bound for this MPC replan.
+
+        When the active destination is a stop goal (destination speed near zero),
+        use a braking-distance cap:
+            v_cap(d) = min(v_max, sqrt(2 * a_brake * max(d - stop_buffer, 0)))
+
+        where a_brake is taken from abs(min_acceleration_mps2).
+        """
+
+        base_max_velocity_mps = float(self.constraints.max_velocity_mps)
+        if not bool(self.final_stop_speed_cap_enabled):
+            return float(base_max_velocity_mps)
+        if len(destination_state) < 2:
+            return float(base_max_velocity_mps)
+
+        destination_speed_mps = (
+            abs(float(destination_state[2]))
+            if len(destination_state) >= 3
+            else 0.0
+        )
+        if (
+            not bool(force_stop_goal)
+            and (
+                len(destination_state) < 3
+                or destination_speed_mps > float(self.final_stop_speed_cap_activation_threshold_mps)
+            )
+        ):
+            return float(base_max_velocity_mps)
+
+        current_x_m = float(current_state[0]) if len(current_state) >= 1 else 0.0
+        current_y_m = float(current_state[1]) if len(current_state) >= 2 else 0.0
+        destination_x_m = float(destination_state[0]) if len(destination_state) >= 1 else current_x_m
+        destination_y_m = float(destination_state[1]) if len(destination_state) >= 2 else current_y_m
+        distance_to_destination_m = math.hypot(destination_x_m - current_x_m, destination_y_m - current_y_m)
+        remaining_stop_distance_m = max(
+            0.0,
+            float(distance_to_destination_m) - float(self.final_stop_speed_cap_stop_buffer_m),
+        )
+        braking_deceleration_mps2 = max(1e-6, abs(float(self.constraints.min_acceleration_mps2)))
+        speed_cap_mps = math.sqrt(2.0 * braking_deceleration_mps2 * remaining_stop_distance_m)
+        return float(min(base_max_velocity_mps, speed_cap_mps))
+
+    def _minimum_reachable_speed_profile_mps(
+        self,
+        current_speed_mps: float,
+        current_acceleration_mps2: float,
+        braking_deceleration_mps2: float | None = None,
+    ) -> List[float]:
+        """
+        Compute the minimum reachable speed profile under bounded jerk when
+        applying a sustained braking deceleration.
+
+        Defaults to the strongest allowed braking (``min_acceleration_mps2``)
+        when ``braking_deceleration_mps2`` is not given; callers that need a
+        milder, comfort-braking profile (e.g. the MPC fail-safe fallback) can
+        pass a smaller magnitude instead.
+        """
+
+        profile = [max(float(self.constraints.min_velocity_mps), float(current_speed_mps))]
+        min_velocity_mps = float(self.constraints.min_velocity_mps)
+        target_a_mps2 = (
+            float(self.constraints.min_acceleration_mps2)
+            if braking_deceleration_mps2 is None
+            else -abs(float(braking_deceleration_mps2))
+        )
+        jerk_delta_limit = float(self.constraints.max_jerk_mps3) * float(self.dt_s)
+
+        v_k_mps = float(profile[0])
+        a_prev_mps2 = float(current_acceleration_mps2)
+        for _ in range(self.horizon_steps):
+            a_k_mps2 = max(target_a_mps2, a_prev_mps2 - jerk_delta_limit)
+            v_k_mps = max(min_velocity_mps, float(v_k_mps) + float(self.dt_s) * float(a_k_mps2))
+            profile.append(float(v_k_mps))
+            a_prev_mps2 = float(a_k_mps2)
+        return profile
+
+    def _fail_safe_fallback_trajectory(
+        self,
+        *,
+        x0: np.ndarray,
+        rollout_x: np.ndarray,
+        rollout_u: np.ndarray,
+        current_acceleration_mps2: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Deterministic fallback trajectory for a cycle where every QP solve
+        attempt failed.
+
+        The plain rollout returned before this method existed is only an
+        open-loop kinematic guess toward the destination -- it is not
+        guaranteed to decelerate, so handing it straight to the controller on
+        solver failure could keep the vehicle moving at an unvalidated speed.
+        This escalates with consecutive failure count instead, per the
+        architecture proposal's Phase 4 fail-safe requirement:
+          - below ``fail_safe_emergency_stop_failure_threshold``: keep the
+            rollout's path (x, y, heading) but override its speed with a
+            comfortable braking profile ("brake gently, hold last safe
+            path").
+          - at/above that threshold: switch to the strongest allowed braking
+            (``min_acceleration_mps2``), i.e. a true emergency stop.
+        """
+        emergency = (
+            int(self._consecutive_solver_failure_count)
+            >= int(self.fail_safe_emergency_stop_failure_threshold)
+        )
+        speed_profile_mps = self._minimum_reachable_speed_profile_mps(
+            current_speed_mps=float(x0[2]),
+            current_acceleration_mps2=float(current_acceleration_mps2),
+            braking_deceleration_mps2=(
+                None if emergency else float(self.fail_safe_gentle_brake_deceleration_mps2)
+            ),
+        )
+
+        x_solution = np.array(rollout_x, dtype=float)
+        u_solution = np.array(rollout_u, dtype=float)
+        min_velocity_mps = float(self.constraints.min_velocity_mps)
+        for k in range(self.horizon_steps + 1):
+            x_solution[k, 2] = max(min_velocity_mps, float(speed_profile_mps[k]))
+        for k in range(int(u_solution.shape[0])):
+            v_before_mps = float(x_solution[k, 2])
+            v_after_mps = float(x_solution[k + 1, 2])
+            u_solution[k, 0] = self._clamp(
+                (v_after_mps - v_before_mps) / float(self.dt_s),
+                float(self.constraints.min_acceleration_mps2),
+                float(self.constraints.max_acceleration_mps2),
+            )
+        print(
+            "[MPC] "
+            + ("EMERGENCY STOP" if emergency else "brake-gently")
+            + " fail-safe fallback trajectory "
+            + f"(consecutive_failures={int(self._consecutive_solver_failure_count)})"
+        )
+        return x_solution, u_solution
+
+    def _future_speed_upper_bound_mps(
+        self,
+        active_speed_upper_bound_mps: float,
+        future_state_index: int,
+        reachable_speed_floor_profile_mps: Sequence[float] | None = None,
+    ) -> float:
+        """
+        Compute a feasible per-stage future speed upper bound.
+
+        If the current speed is already above the active cap, the QP must still
+        remain feasible under bounded braking. This upper bound therefore follows
+        the fastest physically achievable deceleration envelope down toward the
+        active cap.
+        """
+
+        future_state_index = max(1, int(future_state_index))
+        base_max_velocity_mps = float(self.constraints.max_velocity_mps)
+        min_velocity_mps = float(self.constraints.min_velocity_mps)
+        active_speed_upper_bound_mps = min(float(base_max_velocity_mps), max(min_velocity_mps, float(active_speed_upper_bound_mps)))
+        if reachable_speed_floor_profile_mps is None or len(reachable_speed_floor_profile_mps) == 0:
+            reachable_speed_floor_mps = float(min_velocity_mps)
+        else:
+            profile_idx = min(int(future_state_index), len(reachable_speed_floor_profile_mps) - 1)
+            reachable_speed_floor_mps = max(
+                min_velocity_mps,
+                float(reachable_speed_floor_profile_mps[profile_idx]),
+            )
+        return float(min(base_max_velocity_mps, max(active_speed_upper_bound_mps, reachable_speed_floor_mps)))
+
+    def _cg_slip_angle_beta(self, delta_rad: float) -> float:
+        """
+        Intent:
+            Compute the CG-reference kinematic bicycle slip angle beta.
+
+        Equation:
+            beta = atan((l_r / L) * tan(delta))
+        """
+
+        k_ratio = float(self.l_r_m / max(1e-9, self.wheelbase_m))
+        return float(math.atan(k_ratio * math.tan(float(delta_rad))))
+
+    def _cg_slip_angle_beta_derivative(self, delta_rad: float) -> float:
+        """
+        Intent:
+            Compute d(beta)/d(delta) for linearizing the CG-reference model.
+        """
+
+        delta_rad = float(delta_rad)
+        k_ratio = float(self.l_r_m / max(1e-9, self.wheelbase_m))
+        cos_delta = math.cos(delta_rad)
+        sec_delta_sq = 1.0 / max(1e-9, cos_delta * cos_delta)
+        tan_delta = math.tan(delta_rad)
+        return float((k_ratio * sec_delta_sq) / (1.0 + (k_ratio * tan_delta) ** 2))
+
+    def _reference_rollout(
+        self,
+        x0: np.ndarray,
+        x_ref_target: np.ndarray,
+        lane_center_reference: Sequence[Mapping[str, object]] | None,
+        object_snapshots: Sequence[Mapping[str, object]],
+        speed_upper_bound_mps: float | None = None,
+        reachable_speed_floor_profile_mps: Sequence[float] | None = None,
+        seed_state_traj: np.ndarray | None = None,
+        seed_control_traj: np.ndarray | None = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Intent:
+            Build a deterministic nonlinear rollout used as the linearization
+            reference for the LTV-MPC QP.
+
+        Logic:
+            - Prefer stage-wise lane-center targets when available.
+            - Blend path heading with line-of-sight heading to the next path point.
+            - Reduce rollout speed when a lead obstacle is predicted ahead.
+            - Propagate with the nonlinear CG-reference kinematic bicycle model.
+
+        Output:
+            x_ref_traj:
+                np.ndarray, shape (N+1,4)
+            u_ref_traj:
+                np.ndarray, shape (N,2)
+        """
+
+        effective_speed_upper_bound_mps = float(self.constraints.max_velocity_mps)
+        if speed_upper_bound_mps is not None:
+            effective_speed_upper_bound_mps = min(
+                float(effective_speed_upper_bound_mps),
+                max(float(self.constraints.min_velocity_mps), float(speed_upper_bound_mps)),
+            )
+        if (
+            seed_state_traj is not None
+            and seed_control_traj is not None
+            and seed_state_traj.shape == (self.horizon_steps + 1, self.nx)
+            and seed_control_traj.shape == (self.horizon_steps, self.nu)
+        ):
+            x_seed = np.asarray(seed_state_traj, dtype=float).copy()
+            u_seed = np.asarray(seed_control_traj, dtype=float).copy()
+            x_seed[0] = np.asarray(x0, dtype=float)
+            for k in range(1, self.horizon_steps + 1):
+                stage_speed_upper_bound_mps = self._future_speed_upper_bound_mps(
+                    active_speed_upper_bound_mps=float(effective_speed_upper_bound_mps),
+                    future_state_index=int(k),
+                    reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
+                )
+                x_seed[k, 2] = self._clamp(
+                    float(x_seed[k, 2]),
+                    float(self.constraints.min_velocity_mps),
+                    float(stage_speed_upper_bound_mps),
+                )
+            x_seed[:, 3] = np.asarray([self._wrap_angle(float(angle)) for angle in x_seed[:, 3]], dtype=float)
+            return x_seed, u_seed
+
+        x_ref_traj = np.zeros((self.horizon_steps + 1, self.nx), dtype=float)
+        u_ref_traj = np.zeros((self.horizon_steps, self.nu), dtype=float)
+        x_ref_traj[0] = x0
+
+        x_goal, y_goal, v_goal, psi_goal = [float(v) for v in x_ref_target]
+        v_goal = self._clamp(v_goal, self.constraints.min_velocity_mps, effective_speed_upper_bound_mps)
+        psi_goal = self._wrap_angle(psi_goal)
+
+        for k in range(self.horizon_steps):
+            x_m, y_m, v_mps, psi_rad = [float(v) for v in x_ref_traj[k]]
+            target_x_m = float(x_goal)
+            target_y_m = float(y_goal)
+            path_heading_rad = float(psi_goal)
+
+            if bool(self.reference_prefer_lane_center_path):
+                stage_ref = self._get_lane_center_stage_ref(
+                    lane_center_reference=lane_center_reference,
+                    stage_index=int(k + 1),
+                )
+                if stage_ref is not None:
+                    target_x_m = float(stage_ref[0])
+                    target_y_m = float(stage_ref[1])
+                    path_heading_rad = float(stage_ref[2])
+
+            dx_target = target_x_m - x_m
+            dy_target = target_y_m - y_m
+            los_heading_rad = (
+                math.atan2(dy_target, dx_target)
+                if (abs(dx_target) + abs(dy_target)) > 1e-9
+                else float(path_heading_rad)
+            )
+            desired_heading = self._blend_heading_angles(
+                path_heading_rad=float(path_heading_rad),
+                los_heading_rad=float(los_heading_rad),
+                los_weight=float(self.reference_path_los_heading_blend),
+            )
+            heading_error = self._wrap_angle(desired_heading - psi_rad)
+            # Scale steering authority linearly with speed to prevent the
+            # rollout from curving into circular arcs at near-zero speed.
+            # Below 0.5 m/s the gain tapers to 0; above 1.5 m/s it is full.
+            _low_spd_lo = 0.5   # [m/s] gain = 0 at or below this speed
+            _low_spd_hi = 1.5   # [m/s] gain = 1 at or above this speed
+            _spd_scale = min(
+                1.0,
+                max(0.0, (v_mps - _low_spd_lo) / max(1e-9, _low_spd_hi - _low_spd_lo)),
+            )
+            delta_des = self._clamp(
+                self.reference_heading_gain * heading_error * _spd_scale,
+                self.constraints.min_steer_rad,
+                self.constraints.max_steer_rad,
+            )
+
+            stage_speed_target_mps = self._compute_reference_rollout_speed_limit(
+                stage_x_m=x_m,
+                stage_y_m=y_m,
+                stage_heading_rad=float(path_heading_rad),
+                stage_index=int(k),
+                base_speed_mps=float(v_goal),
+                object_snapshots=object_snapshots,
+            )
+            next_stage_speed_upper_bound_mps = self._future_speed_upper_bound_mps(
+                active_speed_upper_bound_mps=float(effective_speed_upper_bound_mps),
+                future_state_index=int(k + 1),
+                reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
+            )
+            stage_speed_target_mps = min(float(stage_speed_target_mps), float(next_stage_speed_upper_bound_mps))
+            accel_des = self.reference_speed_gain * (stage_speed_target_mps - v_mps)
+            accel_des = self._clamp(
+                accel_des,
+                self.constraints.min_acceleration_mps2,
+                self.constraints.max_acceleration_mps2,
+            )
+
+            u_ref_traj[k] = np.array([accel_des, delta_des], dtype=float)
+
+            beta_rad = self._cg_slip_angle_beta(delta_des)
+            x_next = x_m + self.dt_s * v_mps * math.cos(psi_rad + beta_rad)
+            y_next = y_m + self.dt_s * v_mps * math.sin(psi_rad + beta_rad)
+            v_next = self._clamp(
+                v_mps + self.dt_s * accel_des,
+                self.constraints.min_velocity_mps,
+                float(next_stage_speed_upper_bound_mps),
+            )
+            psi_next = self._wrap_angle(psi_rad + self.dt_s * (v_mps / self.l_r_m) * math.sin(beta_rad))
+            x_ref_traj[k + 1] = np.array([x_next, y_next, v_next, psi_next], dtype=float)
+
+        return x_ref_traj, u_ref_traj
+
+    def _linearize_dynamics(self, x_bar: np.ndarray, u_bar: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Intent:
+            Linearize Euler-discretized CG-reference kinematic bicycle dynamics
+            around one reference point (x_bar, u_bar).
+
+        QP form used:
+            X_{k+1} = A_k X_k + B_k U_k + c_k
+        """
+
+        x_m, y_m, v_mps, psi_rad = [float(v) for v in x_bar]
+        a_mps2, delta_rad = [float(v) for v in u_bar]
+        _ = x_m, y_m, a_mps2
+
+        dt_s = float(self.dt_s)
+        l_r_m = float(self.l_r_m)
+        beta_rad = self._cg_slip_angle_beta(delta_rad)
+        beta_delta = self._cg_slip_angle_beta_derivative(delta_rad)
+        cos_sum = math.cos(psi_rad + beta_rad)
+        sin_sum = math.sin(psi_rad + beta_rad)
+        sin_beta = math.sin(beta_rad)
+        cos_beta = math.cos(beta_rad)
+
+        A_k = np.array(
+            [
+                [1.0, 0.0, dt_s * cos_sum, -dt_s * v_mps * sin_sum],
+                [0.0, 1.0, dt_s * sin_sum, dt_s * v_mps * cos_sum],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, dt_s * sin_beta / l_r_m, 1.0],
+            ],
+            dtype=float,
+        )
+        B_k = np.array(
+            [
+                [0.0, -dt_s * v_mps * sin_sum * beta_delta],
+                [0.0, dt_s * v_mps * cos_sum * beta_delta],
+                [dt_s, 0.0],
+                [0.0, dt_s * (v_mps / l_r_m) * cos_beta * beta_delta],
+            ],
+            dtype=float,
+        )
+
+        f_bar = np.array(
+            [
+                float(x_bar[0] + dt_s * v_mps * cos_sum),
+                float(x_bar[1] + dt_s * v_mps * sin_sum),
+                float(x_bar[2] + dt_s * u_bar[0]),
+                float(self._wrap_angle(x_bar[3] + dt_s * (v_mps / l_r_m) * sin_beta)),
+            ],
+            dtype=float,
+        )
+        c_k = f_bar - A_k @ x_bar - B_k @ u_bar
+        return A_k, B_k, c_k
+
+    def _build_qp(
+        self,
+        x0: np.ndarray,
+        x_ref_target: np.ndarray,
+        object_snapshots: Sequence[Mapping[str, object]],
+        current_acceleration_mps2: float,
+        current_steering_rad: float,
+        x_ref_rollout: np.ndarray,
+        u_ref_rollout: np.ndarray,
+        lane_center_reference: Sequence[Mapping[str, object]] | None,
+        speed_upper_bound_mps: float | None,
+        reachable_speed_floor_profile_mps: Sequence[float] | None,
+    ) -> Tuple[sp.csc_matrix, np.ndarray, sp.csc_matrix, np.ndarray, np.ndarray, QPIndex]:
+        """
+        Intent:
+            Build the full convex QP matrices for OSQP.
+
+        Important implementation note:
+            Collision-checker auxiliary constraints are disabled in this mode.
+            Obstacle handling is done through repulsive-potential cost shaping.
+        """
+
+        object_count = len(object_snapshots)
+        road_boundary_term_active = (
+            bool(getattr(self, "road_boundary_enabled", True))
+            and float(getattr(self, "road_boundary_weight", self.lane_keep_boundary_weight)) > 0.0
+        )
+        index = QPIndex(
+            nx=self.nx,
+            nu=self.nu,
+            horizon_steps=self.horizon_steps,
+            road_boundary_slack_pair_count=(
+                int(self.horizon_steps) if road_boundary_term_active else 0
+            ),
+        )
+        n_var = index.total_variables
+        effective_speed_upper_bound_mps = float(self.constraints.max_velocity_mps)
+        if speed_upper_bound_mps is not None:
+            effective_speed_upper_bound_mps = min(
+                float(effective_speed_upper_bound_mps),
+                max(float(self.constraints.min_velocity_mps), float(speed_upper_bound_mps)),
+            )
+
+        # --- Helpers for sparse QP assembly ---
+        q = np.zeros(n_var, dtype=float)
+        p_entries: Dict[Tuple[int, int], float] = {}
+        a_row: List[int] = []
+        a_col: List[int] = []
+        a_data: List[float] = []
+        lower_bounds: List[float] = []
+        upper_bounds: List[float] = []
+
+        def add_p_entry(i: int, j: int, value: float) -> None:
+            if abs(value) < 1e-12:
+                return
+            ii, jj = (i, j) if i <= j else (j, i)
+            p_entries[(ii, jj)] = p_entries.get((ii, jj), 0.0) + float(value)
+
+        def add_quadratic(var_idx: int, weight: float) -> None:
+            if weight <= 0.0:
+                return
+            add_p_entry(var_idx, var_idx, 2.0 * float(weight))
+
+        def add_tracking(var_idx: int, weight: float, ref_value: float) -> None:
+            if weight <= 0.0:
+                return
+            add_quadratic(var_idx, weight)
+            q[var_idx] += -2.0 * float(weight) * float(ref_value)
+
+        def add_constraint(coeffs: Mapping[int, float], lower: float, upper: float) -> None:
+            row_idx = len(lower_bounds)
+            for col_idx, coeff in coeffs.items():
+                if abs(float(coeff)) < 1e-12:
+                    continue
+                a_row.append(row_idx)
+                a_col.append(int(col_idx))
+                a_data.append(float(coeff))
+            lower_bounds.append(float(lower))
+            upper_bounds.append(float(upper))
+
+        # Reference state is the destination state.
+        # The image shows the state-tracking sum from k=0..N. Here the k=0 term
+        # is omitted from optimization assembly because X_0 is fixed by an
+        # equality constraint, so that term is a constant offset and does not
+        # change the optimizer solution.
+        x_ref_value = float(x_ref_target[0])
+        y_ref_value = float(x_ref_target[1])
+        v_ref_value = float(x_ref_target[2])
+        psi_ref_value = float(x_ref_target[3])
+
+        # --- Objective: control term Cost_Control ---
+        # Penalizes rapid changes in acceleration and steering across horizon.
+        comfort_scale = float(self.comfort_cost.w_comf)
+
+        # J_ctrl rate terms: ((a_k-a_{k-1})/dt)^2 + ((delta_k-delta_{k-1})/dt)^2
+        qa_eff = comfort_scale * float(self.comfort_cost.qa) / max(1e-9, self.dt_s * self.dt_s)
+        qd_eff = comfort_scale * float(self.comfort_cost.qdelta) / max(1e-9, self.dt_s * self.dt_s)
+
+        def add_rate_penalty(var_idx: int, prev_idx: int | None, prev_value: float, weight: float) -> None:
+            if weight <= 0.0:
+                return
+            if prev_idx is None:
+                # (u - u_prev_const)^2
+                add_quadratic(var_idx, weight)
+                q[var_idx] += -2.0 * float(weight) * float(prev_value)
+                return
+            # (u_k - u_{k-1})^2 = u_k^2 + u_{k-1}^2 - 2 u_k u_{k-1}
+            add_quadratic(var_idx, weight)
+            add_quadratic(prev_idx, weight)
+            add_p_entry(var_idx, prev_idx, -2.0 * float(weight))
+
+        for k in range(self.horizon_steps):
+            a_idx = index.control_index(k, 0)
+            d_idx = index.control_index(k, 1)
+            if k == 0:
+                add_rate_penalty(a_idx, None, float(current_acceleration_mps2), qa_eff)
+                add_rate_penalty(d_idx, None, float(current_steering_rad), qd_eff)
+            else:
+                add_rate_penalty(a_idx, index.control_index(k - 1, 0), 0.0, qa_eff)
+                add_rate_penalty(d_idx, index.control_index(k - 1, 1), 0.0, qd_eff)
+
+        # --- Objective: attractive term Cost_ref ---
+        # Quadratic pull to destination reference state.
+        attractive_scale = float(self.safety_cost.w_safe)
+        w_qx_safe = attractive_scale * float(self.comfort_cost.qx)
+        w_qy_safe = attractive_scale * float(self.comfort_cost.qy)
+        w_qv_safe = attractive_scale * float(self.comfort_cost.qv)
+        w_qpsi_safe = attractive_scale * float(self.comfort_cost.qpsi)
+        for k in range(1, self.horizon_steps + 1):
+            x_k_idx = index.state_index(k, 0)
+            y_k_idx = index.state_index(k, 1)
+            add_tracking(x_k_idx, w_qx_safe, x_ref_value)
+            add_tracking(y_k_idx, w_qy_safe, y_ref_value)
+            add_tracking(index.state_index(k, 2), w_qv_safe, v_ref_value)
+            add_tracking(index.state_index(k, 3), w_qpsi_safe, psi_ref_value)
+
+            # Lane-center-follow term:
+            #   P_att_lane = w_lane * e_y^2 + w_lane * q_psi_lane * e_psi^2,
+            # where
+            #   e_y   = -(x-x_ref)sin(theta_ref) + (y-y_ref)cos(theta_ref)
+            #   e_psi = wrap(psi - theta_ref)
+            lane_sample = self._get_lane_center_stage_sample(
+                lane_center_reference=lane_center_reference,
+                stage_index=int(k),
+                query_x_m=float(x_ref_rollout[k, 0]),
+                query_y_m=float(x_ref_rollout[k, 1]),
+            )
+            lane_reference = normalize_lane_reference_sample(
+                lane_sample,
+                default_lane_width_m=float(getattr(self, "lane_width_m", 4.0)),
+            )
+            if lane_reference is not None:
+                centerline_xy_weight = float(getattr(self, "lane_center_follow_xy_weight", 0.0))
+                if bool(self.lane_center_follow_enabled) and float(centerline_xy_weight) > 0.0:
+                    add_tracking(x_k_idx, centerline_xy_weight, float(lane_reference.x_center_m))
+                    add_tracking(y_k_idx, centerline_xy_weight, float(lane_reference.y_center_m))
+
+                lane_affine = signed_lateral_offset_affine_form(lane_reference)
+                a_coef = float(lane_affine.x_coef)
+                b_coef = float(lane_affine.y_coef)
+                c_coef = float(lane_affine.constant)
+                lane_heading_ref = float(lane_reference.heading_rad)
+
+                if bool(self.lane_center_follow_enabled) and float(self.lane_center_follow_weight) > 0.0:
+                    lane_weight = float(self.lane_center_follow_weight)
+                    lane_heading_weight = lane_weight * float(self.lane_center_follow_qpsi)
+                    lane_heading_ref_aligned = self._align_angle_near(
+                        angle_rad=float(lane_heading_ref),
+                        around_rad=float(x_ref_rollout[k, 3]),
+                    )
+
+                    add_quadratic(x_k_idx, lane_weight * a_coef * a_coef)
+                    add_quadratic(y_k_idx, lane_weight * b_coef * b_coef)
+                    add_p_entry(x_k_idx, y_k_idx, 2.0 * lane_weight * a_coef * b_coef)
+                    q[x_k_idx] += 2.0 * lane_weight * a_coef * c_coef
+                    q[y_k_idx] += 2.0 * lane_weight * b_coef * c_coef
+                    if lane_heading_weight > 0.0:
+                        add_tracking(index.state_index(k, 3), lane_heading_weight, lane_heading_ref_aligned)
+
+                if road_boundary_term_active:
+                    left_slack_idx = index.road_boundary_left_slack_index(k)
+                    right_slack_idx = index.road_boundary_right_slack_index(k)
+                    road_weight = float(getattr(self, "road_boundary_weight", self.lane_keep_boundary_weight))
+                    road_margin_m = float(getattr(self, "road_boundary_margin_m", 0.5))
+                    road_center_offset_m = float(lane_reference.road_center_offset_m)
+                    road_left_width_m = float(lane_reference.left_road_width_m)
+                    road_right_width_m = float(lane_reference.right_road_width_m)
+                    add_quadratic(left_slack_idx, road_weight)
+                    add_quadratic(right_slack_idx, road_weight)
+                    add_constraint(
+                        {
+                            x_k_idx: -a_coef,
+                            y_k_idx: -b_coef,
+                            left_slack_idx: 1.0,
+                        },
+                        float(road_margin_m) - float(road_left_width_m) + float(c_coef) - float(road_center_offset_m),
+                        np.inf,
+                    )
+                    add_constraint(
+                        {
+                            x_k_idx: a_coef,
+                            y_k_idx: b_coef,
+                            right_slack_idx: 1.0,
+                        },
+                        float(road_margin_m) - float(road_right_width_m) - float(c_coef) + float(road_center_offset_m),
+                        np.inf,
+                    )
+                    road_max_slack_m = float(getattr(self, "road_boundary_max_slack_m", np.inf))
+                    road_slack_upper = (
+                        float(road_max_slack_m)
+                        if math.isfinite(float(road_max_slack_m)) and float(road_max_slack_m) > 0.0
+                        else np.inf
+                    )
+                    add_constraint({left_slack_idx: 1.0}, 0.0, road_slack_upper)
+                    add_constraint({right_slack_idx: 1.0}, 0.0, road_slack_upper)
+
+        # --- Objective: repulsive potential field Cost_Repulsive ---
+        # Super-ellipsoid obstacle cost from `super_ellipsoid.py`, approximated
+        # by a local quadratic Taylor model in [x, y, v, psi] for each stage.
+        if bool(self.repulsive_cost.enabled) and object_count > 0:
+            for k in range(1, self.horizon_steps + 1):
+                stage_idx = k - 1
+                x_idx = index.state_index(k, 0)
+                y_idx = index.state_index(k, 1)
+                v_idx = index.state_index(k, 2)
+                psi_idx = index.state_index(k, 3)
+
+                ego_state_ref = np.array(
+                    [
+                        float(x_ref_rollout[k, 0]),
+                        float(x_ref_rollout[k, 1]),
+                        float(x_ref_rollout[k, 2]),
+                        float(self._wrap_angle(float(x_ref_rollout[k, 3]))),
+                    ],
+                    dtype=float,
+                )
+                state_indices = [x_idx, y_idx, v_idx, psi_idx]
+
+                for object_snapshot in object_snapshots:
+                    obj_state = self._get_object_state_at_stage(
+                        object_snapshot=object_snapshot,
+                        stage_index=stage_idx,
+                        dt_s=float(self.dt_s),
+                    )
+
+                    repulsive_weight = float(object_snapshot.get("repulsive_class_weight", 1.0))
+                    if repulsive_weight <= 0.0:
+                        continue
+
+                    obstacle_length_m = float(object_snapshot.get("length_m", 4.5))
+                    obstacle_width_m = float(object_snapshot.get("width_m", 2.0))
+                    _p0, gradient, hessian = self._superellipsoid_cost_taylor_terms(
+                        ego_state_ref=ego_state_ref,
+                        obstacle_state=obj_state,
+                        obstacle_length_m=obstacle_length_m,
+                        obstacle_width_m=obstacle_width_m,
+                    )
+
+                    gradient = float(repulsive_weight) * np.asarray(gradient, dtype=float)
+                    hessian = float(repulsive_weight) * np.asarray(hessian, dtype=float)
+
+                    if bool(self.repulsive_cost.project_hessian_psd):
+                        hessian = self._project_symmetric_hessian_to_psd(hessian=hessian)
+
+                    linear_term = np.asarray(gradient - hessian @ ego_state_ref, dtype=float)
+
+                    for row_local, row_idx in enumerate(state_indices):
+                        q[row_idx] += float(linear_term[row_local])
+                        for col_local in range(row_local, len(state_indices)):
+                            add_p_entry(
+                                row_idx,
+                                state_indices[col_local],
+                                float(hessian[row_local, col_local]),
+                            )
+
+        # Optional tiny regularization on controls to improve numerical conditioning.
+        # This does not change the problem meaningfully but stabilizes OSQP.
+        tiny_reg = 1e-6
+        for k in range(self.horizon_steps):
+            add_quadratic(index.control_index(k, 0), tiny_reg)
+            add_quadratic(index.control_index(k, 1), tiny_reg)
+        if road_boundary_term_active:
+            for k in range(1, self.horizon_steps + 1):
+                add_quadratic(index.road_boundary_left_slack_index(k), tiny_reg)
+                add_quadratic(index.road_boundary_right_slack_index(k), tiny_reg)
+
+        # --- Constraints ---
+        # Initial state equality X_0 = current state.
+        for i in range(self.nx):
+            add_constraint({index.state_index(0, i): 1.0}, float(x0[i]), float(x0[i]))
+
+        # LTV dynamics equality constraints.
+        for k in range(self.horizon_steps):
+            A_k, B_k, c_k = self._linearize_dynamics(x_ref_rollout[k], u_ref_rollout[k])
+            for i in range(self.nx):
+                coeffs: Dict[int, float] = {index.state_index(k + 1, i): 1.0}
+                for j in range(self.nx):
+                    coeffs[index.state_index(k, j)] = coeffs.get(index.state_index(k, j), 0.0) - float(A_k[i, j])
+                for j in range(self.nu):
+                    coeffs[index.control_index(k, j)] = coeffs.get(index.control_index(k, j), 0.0) - float(B_k[i, j])
+                add_constraint(coeffs, float(c_k[i]), float(c_k[i]))
+
+        # Speed constraints for future states.
+        for k in range(1, self.horizon_steps + 1):
+            stage_speed_upper_bound_mps = self._future_speed_upper_bound_mps(
+                active_speed_upper_bound_mps=float(effective_speed_upper_bound_mps),
+                future_state_index=int(k),
+                reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
+            )
+            add_constraint(
+                {index.state_index(k, 2): 1.0},
+                self.constraints.min_velocity_mps,
+                float(stage_speed_upper_bound_mps),
+            )
+        # Optional hard terminal-speed constraint. Apply it only for stop-like
+        # destinations (destination speed near zero), otherwise every rolling
+        # temporary goal would incorrectly force the horizon-end speed to zero.
+        terminal_speed_constraint_active = bool(self.constraints.enforce_terminal_velocity_constraint) and (
+            abs(float(x_ref_target[2])) <= float(self.final_stop_speed_cap_activation_threshold_mps)
+        )
+        if terminal_speed_constraint_active:
+            add_constraint(
+                {index.state_index(self.horizon_steps, 2): 1.0},
+                float(self.constraints.terminal_velocity_mps),
+                float(self.constraints.terminal_velocity_mps),
+            )
+
+        # Acceleration and steering bounds.
+        for k in range(self.horizon_steps):
+            add_constraint(
+                {index.control_index(k, 0): 1.0},
+                self.constraints.min_acceleration_mps2,
+                self.constraints.max_acceleration_mps2,
+            )
+            add_constraint(
+                {index.control_index(k, 1): 1.0},
+                self.constraints.min_steer_rad,
+                self.constraints.max_steer_rad,
+            )
+        # Jerk bounds |a_k - a_{k-1}| <= j_max * dt.
+        jerk_delta_limit = float(self.constraints.max_jerk_mps3) * float(self.dt_s)
+        for k in range(self.horizon_steps):
+            a_k_idx = index.control_index(k, 0)
+            if k == 0:
+                add_constraint(
+                    {a_k_idx: 1.0},
+                    float(current_acceleration_mps2) - jerk_delta_limit,
+                    float(current_acceleration_mps2) + jerk_delta_limit,
+                )
+            else:
+                a_km1_idx = index.control_index(k - 1, 0)
+                add_constraint({a_k_idx: 1.0, a_km1_idx: -1.0}, -jerk_delta_limit, jerk_delta_limit)
+
+        # Steering-rate bounds:
+        #   min_rate <= (delta_k - delta_{k-1}) / dt <= max_rate
+        # where delta_{-1} is the currently applied steering angle.
+        steer_delta_min = float(self.constraints.min_steer_rate_rps) * float(self.dt_s)
+        steer_delta_max = float(self.constraints.max_steer_rate_rps) * float(self.dt_s)
+        for k in range(self.horizon_steps):
+            d_k_idx = index.control_index(k, 1)
+            if k == 0:
+                add_constraint(
+                    {d_k_idx: 1.0},
+                    float(current_steering_rad) + steer_delta_min,
+                    float(current_steering_rad) + steer_delta_max,
+                )
+            else:
+                d_km1_idx = index.control_index(k - 1, 1)
+                add_constraint(
+                    {d_k_idx: 1.0, d_km1_idx: -1.0},
+                    steer_delta_min,
+                    steer_delta_max,
+                )
+        # Collision-checker constraints removed per configuration.
+
+        # Assemble sparse matrices.
+        if len(p_entries) == 0:
+            P = sp.csc_matrix((n_var, n_var), dtype=float)
+        else:
+            p_rows = [idx_pair[0] for idx_pair in p_entries.keys()]
+            p_cols = [idx_pair[1] for idx_pair in p_entries.keys()]
+            p_vals = [val for val in p_entries.values()]
+            P = sp.csc_matrix((p_vals, (p_rows, p_cols)), shape=(n_var, n_var), dtype=float)
+
+        A = sp.csc_matrix((a_data, (a_row, a_col)), shape=(len(lower_bounds), n_var), dtype=float)
+        l = np.asarray(lower_bounds, dtype=float)
+        u = np.asarray(upper_bounds, dtype=float)
+        return P, q, A, l, u, index
+
+    def _solve_qp(
+        self,
+        P: sp.csc_matrix,
+        q: np.ndarray,
+        A: sp.csc_matrix,
+        l: np.ndarray,
+        u: np.ndarray,
+    ) -> Tuple[np.ndarray | None, str, float]:
+        """Solve the QP with OSQP and return solution/status/time."""
+
+        solver = osqp.OSQP()  # type: ignore[union-attr]
+        t0 = time.perf_counter()
+        solver.setup(
+            P=P,
+            q=q,
+            A=A,
+            l=l,
+            u=u,
+            verbose=False,
+            warm_start= True,
+            polish=self.qp_polish,
+            max_iter=self.qp_max_iter,
+            eps_abs=self.qp_eps_abs,
+            eps_rel=self.qp_eps_rel,
+            adaptive_rho=True,
+        )
+        result = solver.solve()
+        solve_time_ms = (time.perf_counter() - t0) * 1000.0
+        status = str(result.info.status).lower()
+        if result.x is None or "solved" not in status:
+            return None, status, float(solve_time_ms)
+        return np.asarray(result.x, dtype=float), status, float(solve_time_ms)
+
+    def _extract_solution(self, solution: np.ndarray, index: QPIndex) -> Tuple[np.ndarray, np.ndarray]:
+        x_traj = np.zeros((self.horizon_steps + 1, self.nx), dtype=float)
+        u_traj = np.zeros((self.horizon_steps, self.nu), dtype=float)
+        for k in range(self.horizon_steps + 1):
+            for i in range(self.nx):
+                x_traj[k, i] = float(solution[index.state_index(k, i)])
+            x_traj[k, 3] = self._wrap_angle(float(x_traj[k, 3]))
+        for k in range(self.horizon_steps):
+            for i in range(self.nu):
+                u_traj[k, i] = float(solution[index.control_index(k, i)])
+        return x_traj, u_traj
+
+    def _evaluate_lane_keeping_profile(
+        self,
+        x_traj: np.ndarray,
+        lane_center_reference: Sequence[Mapping[str, object]] | None,
+    ) -> LaneKeepingProfile:
+        lane_stage_samples: List[Dict[str, float] | None] = []
+        state_xy: List[Tuple[float, float]] = []
+        stage_count = min(int(x_traj.shape[0]), int(self.horizon_steps) + 1)
+        for stage_index in range(stage_count):
+            state_xy.append(
+                (
+                    float(x_traj[stage_index, 0]),
+                    float(x_traj[stage_index, 1]),
+                )
+            )
+            lane_stage_samples.append(
+                self._get_lane_center_stage_sample(
+                    lane_center_reference=lane_center_reference,
+                    stage_index=int(stage_index),
+                    query_x_m=float(x_traj[stage_index, 0]),
+                    query_y_m=float(x_traj[stage_index, 1]),
+                )
+            )
+
+        lane_center_weight = (
+            float(self.lane_center_follow_weight)
+            if bool(self.lane_center_follow_enabled)
+            else 0.0
+        )
+        road_boundary_weight = (
+            float(getattr(self, "road_boundary_weight", self.lane_keep_boundary_weight))
+            if bool(getattr(self, "road_boundary_enabled", True))
+            else 0.0
+        )
+        return evaluate_lane_keeping_profile(
+            state_xy=state_xy,
+            lane_references=lane_stage_samples,
+            centering_weight=float(lane_center_weight),
+            boundary_weight=float(road_boundary_weight),
+            safe_region_alpha=float(self.lane_keep_safe_region_alpha),
+            road_boundary_margin_m=float(getattr(self, "road_boundary_margin_m", 0.5)),
+            default_lane_width_m=float(getattr(self, "lane_width_m", 4.0)),
+        )
+
+    def _evaluate_plan_cost_terms(
+        self,
+        x_traj: np.ndarray,
+        u_traj: np.ndarray,
+        x_ref_target: np.ndarray,
+        object_snapshots: Sequence[Mapping[str, object]],
+        current_acceleration_mps2: float,
+        current_steering_rad: float,
+        lane_center_reference: Sequence[Mapping[str, object]] | None,
+    ) -> Dict[str, float]:
+        """
+        Evaluate per-term objective values for the most recent planned trajectory.
+
+        These values are for runtime diagnostics/plotting and match the active
+        cost terms used by this MPC implementation.
+        """
+
+        attractive_scale = float(self.safety_cost.w_safe)
+        qx = float(self.comfort_cost.qx)
+        qy = float(self.comfort_cost.qy)
+        qv = float(self.comfort_cost.qv)
+        qpsi = float(self.comfort_cost.qpsi)
+
+        x_ref = float(x_ref_target[0])
+        y_ref = float(x_ref_target[1])
+        v_ref = float(x_ref_target[2])
+        psi_ref = float(x_ref_target[3])
+
+        cost_attractive_ref = 0.0
+        for k in range(1, self.horizon_steps + 1):
+            dx = float(x_traj[k, 0]) - x_ref
+            dy = float(x_traj[k, 1]) - y_ref
+            dv = float(x_traj[k, 2]) - v_ref
+            dpsi = self._wrap_angle(float(x_traj[k, 3]) - psi_ref)
+            cost_attractive_ref += qx * dx * dx + qy * dy * dy + qv * dv * dv + qpsi * dpsi * dpsi
+
+        lane_keep_profile = self._evaluate_lane_keeping_profile(
+            x_traj=x_traj,
+            lane_center_reference=lane_center_reference,
+        )
+        self._last_lane_keeping_profile = lane_keep_profile
+        cost_lane_center = 0.0
+        cost_centerline_xy = 0.0
+        cost_road_boundary = 0.0
+        for metric in lane_keep_profile.stage_metrics:
+            if int(metric.stage_index) <= 0:
+                continue
+            lane_sample = self._get_lane_center_stage_sample(
+                lane_center_reference=lane_center_reference,
+                stage_index=int(metric.stage_index),
+                query_x_m=float(x_traj[int(metric.stage_index), 0]),
+                query_y_m=float(x_traj[int(metric.stage_index), 1]),
+            )
+            lane_reference = normalize_lane_reference_sample(
+                lane_sample,
+                default_lane_width_m=float(getattr(self, "lane_width_m", 4.0)),
+            )
+            centerline_xy_weight = float(getattr(self, "lane_center_follow_xy_weight", 0.0))
+            if (
+                lane_reference is not None
+                and bool(self.lane_center_follow_enabled)
+                and float(centerline_xy_weight) > 0.0
+            ):
+                dx_center = float(x_traj[int(metric.stage_index), 0]) - float(lane_reference.x_center_m)
+                dy_center = float(x_traj[int(metric.stage_index), 1]) - float(lane_reference.y_center_m)
+                cost_centerline_xy += float(centerline_xy_weight) * (
+                    float(dx_center) * float(dx_center)
+                    + float(dy_center) * float(dy_center)
+                )
+            cost_lane_center += float(metric.centering_cost)
+            cost_road_boundary += float(metric.boundary_cost)
+            if bool(self.lane_center_follow_enabled) and float(self.lane_center_follow_weight) > 0.0:
+                e_psi_lane = self._wrap_angle(
+                    float(x_traj[int(metric.stage_index), 3]) - float(metric.lane_heading_rad)
+                )
+                cost_lane_center += (
+                    float(self.lane_center_follow_weight)
+                    * float(self.lane_center_follow_qpsi)
+                    * float(e_psi_lane)
+                    * float(e_psi_lane)
+                )
+
+        cost_attractive = attractive_scale * cost_attractive_ref
+        cost_lane_center = float(cost_lane_center)
+        cost_road_boundary = float(cost_road_boundary)
+        j_ctrl = 0.0
+        a_prev = float(current_acceleration_mps2)
+        d_prev = float(current_steering_rad)
+        inv_dt = 1.0 / max(1e-9, float(self.dt_s))
+        qa = float(self.comfort_cost.qa)
+        qd = float(self.comfort_cost.qdelta)
+        for k in range(self.horizon_steps):
+            a_k = float(u_traj[k, 0])
+            d_k = float(u_traj[k, 1])
+            da = (a_k - a_prev) * inv_dt
+            dd = (d_k - d_prev) * inv_dt
+            j_ctrl += qa * da * da + qd * dd * dd
+            a_prev = a_k
+            d_prev = d_k
+        cost_control = float(self.comfort_cost.w_comf) * j_ctrl
+
+        cost_repulsive_safe = 0.0
+        cost_repulsive_collision = 0.0
+        if bool(self.repulsive_cost.enabled) and len(object_snapshots) > 0:
+            for k in range(1, self.horizon_steps + 1):
+                stage_idx = k - 1
+                ego_state = [
+                    float(x_traj[k, 0]),
+                    float(x_traj[k, 1]),
+                    float(x_traj[k, 2]),
+                    float(self._wrap_angle(float(x_traj[k, 3]))),
+                ]
+
+                for object_snapshot in object_snapshots:
+                    obj_state = self._get_object_state_at_stage(
+                        object_snapshot=object_snapshot,
+                        stage_index=stage_idx,
+                        dt_s=float(self.dt_s),
+                    )
+                    repulsive_weight = float(object_snapshot.get("repulsive_class_weight", 1.0))
+                    if repulsive_weight <= 0.0:
+                        continue
+
+                    obstacle_length_m = float(object_snapshot.get("length_m", 4.5))
+                    obstacle_width_m = float(object_snapshot.get("width_m", 2.0))
+                    obstacle_cost_safe, obstacle_cost_collision = self._superellipsoid_obstacle_cost_components(
+                        ego_state=ego_state,
+                        obstacle_state=obj_state,
+                        obstacle_length_m=obstacle_length_m,
+                        obstacle_width_m=obstacle_width_m,
+                    )
+                    cost_repulsive_safe += float(repulsive_weight) * float(obstacle_cost_safe)
+                    cost_repulsive_collision += float(repulsive_weight) * float(obstacle_cost_collision)
+        cost_repulsive = float(cost_repulsive_safe + cost_repulsive_collision)
+        return {
+            "Cost_ref": float(cost_attractive),
+            "Cost_LaneCenter": float(cost_lane_center),
+            "Cost_CenterlineXY": float(cost_centerline_xy),
+            "Cost_RoadBoundary": float(cost_road_boundary),
+            "Cost_LaneBoundary": float(cost_road_boundary),
+            "Cost_Lane": float(cost_lane_center + cost_centerline_xy + cost_road_boundary),
+            "Cost_Repulsive_Safe": float(cost_repulsive_safe),
+            "Cost_Repulsive_Collision": float(cost_repulsive_collision),
+            "Cost_Repulsive": float(cost_repulsive),
+            "Cost_Control": float(cost_control),
+        }
+
+    def plan_trajectory(
+        self,
+        current_state: Sequence[float],
+        destination_state: Sequence[float],
+        object_snapshots: Sequence[Mapping[str, object]],
+        current_acceleration_mps2: float,
+        current_steering_rad: float,
+        lane_center_waypoints: Sequence[Mapping[str, object]] | None = None,
+        lane_center_reference_samples: Sequence[Mapping[str, object]] | None = None,
+        stop_goal_active: bool = False,
+    ) -> List[List[float]]:
+        """
+        Intent:
+            Solve one MPC optimization and return future states [x,y,v,psi].
+        """
+
+        if len(current_state) != 4:
+            raise ValueError("current_state must be [x, y, v, psi].")
+
+        x0 = np.array(
+            [
+                float(current_state[0]),
+                float(current_state[1]),
+                self._clamp(float(current_state[2]), self.constraints.min_velocity_mps, self.constraints.max_velocity_mps),
+                self._wrap_angle(float(current_state[3])),
+            ],
+            dtype=float,
+        )
+        planning_current_acceleration_mps2 = float(current_acceleration_mps2)
+        destination = self._normalize_destination_state(destination_state)
+        destination_lane_id = (
+            int(destination_state[4])
+            if len(destination_state) >= 5
+            else None
+        )
+        active_speed_upper_bound_mps = self._compute_active_speed_upper_bound_mps(
+            current_state=x0,
+            destination_state=destination,
+            force_stop_goal=bool(stop_goal_active),
+        )
+        self._last_active_max_velocity_mps = float(active_speed_upper_bound_mps)
+
+        # Detect a stop goal while destination[2] is still the original value
+        # (0.0 for stop goals set by the behavior planner).
+        _is_stop_goal = bool(stop_goal_active) or (
+            abs(float(destination[2]))
+            <= float(self.final_stop_speed_cap_activation_threshold_mps)
+        )
+        _resume_release_speed_threshold_mps = max(
+            float(self.final_stop_speed_cap_activation_threshold_mps),
+            1.0,
+        )
+        _transitioning_from_stationary_hold = (
+            not bool(_is_stop_goal)
+            and float(x0[2]) <= float(_resume_release_speed_threshold_mps)
+            and float(destination[2]) > float(_resume_release_speed_threshold_mps)
+            and float(planning_current_acceleration_mps2) < -0.05
+        )
+        if _transitioning_from_stationary_hold:
+            planning_current_acceleration_mps2 = 0.0
+
+        if _is_stop_goal:
+            # Replace the static v_ref=0 with a dynamic kinematic profile:
+            #   v_ref = active_speed_upper_bound_mps
+            #         = sqrt(2 * a_brake * max(dist - stop_buffer, 0))
+            # This is the maximum safe speed at the current distance; far from
+            # the stop point it equals v_max, tapering smoothly to 0 only
+            # within the buffer zone.  The rollout therefore keeps moving until
+            # close to the target instead of freezing at v=0 in the middle of
+            # the trajectory — eliminating the degenerate QP that caused the
+            # circular-arc artefact.
+            destination[2] = float(active_speed_upper_bound_mps)
+        else:
+            destination[2] = self._clamp(
+                float(destination[2]),
+                self.constraints.min_velocity_mps,
+                float(active_speed_upper_bound_mps),
+            )
+
+        reachable_speed_floor_profile_mps = self._minimum_reachable_speed_profile_mps(
+            current_speed_mps=float(x0[2]),
+            current_acceleration_mps2=float(planning_current_acceleration_mps2),
+        )
+
+        destination[3] = self._wrap_angle(float(destination[3]))
+
+        lane_center_reference: List[Dict[str, float]] = []
+        should_use_lane_center_reference = (
+            (bool(self.lane_center_follow_enabled) and float(self.lane_center_follow_weight) > 0.0)
+            or (bool(getattr(self, "road_boundary_enabled", True)) and float(getattr(self, "road_boundary_weight", 0.0)) > 0.0)
+            or bool(self.reference_prefer_lane_center_path)
+        )
+        if should_use_lane_center_reference:
+            lane_center_reference = self._normalize_lane_center_reference_samples(
+                lane_center_reference_samples=lane_center_reference_samples,
+            )
+            if len(lane_center_reference) == 0:
+                lane_center_reference = self._build_lane_center_reference(
+                    current_state=x0,
+                    destination_state=destination,
+                    lane_center_waypoints=lane_center_waypoints,
+                    destination_lane_id=destination_lane_id,
+                )
+
+        # During stop-goal mode never reuse the previous QP solution as seed.
+        # Previous plans produced under the old v_ref=0 regime may have been
+        # circular arcs; reusing them would re-seed the bad linearisation point
+        # and perpetuate the instability even after the velocity reference fix.
+        #
+        # On the first non-stop-goal call after a stop goal (the stop→resume
+        # transition), also discard the seed.  The previous solution is a v=0
+        # braking trajectory; using it as the linearisation reference gives a
+        # degenerate QP where every A/B matrix is evaluated at v=0, making
+        # steering effects vanish and cost gradients for acceleration extremely
+        # weak.  Starting from a clean rollout instead lets the reference
+        # propagate acceleration properly and allows the QP to plan a
+        # physically meaningful re-acceleration trajectory.
+        _transitioning_from_stop = bool(self._last_was_stop_goal) and not bool(_is_stop_goal)
+        if _is_stop_goal or _transitioning_from_stop or _transitioning_from_stationary_hold:
+            shifted_seed = None
+            if _transitioning_from_stop or _transitioning_from_stationary_hold:
+                # Also drop any stored solution so _build_shifted_previous_solution_seed
+                # cannot return it on a later call before the ego has moved.
+                self._previous_x_solution = None
+                self._previous_u_solution = None
+        else:
+            shifted_seed = self._build_shifted_previous_solution_seed(x0=x0)
+        x_ref_rollout, u_ref_rollout = self._reference_rollout(
+            x0=x0,
+            x_ref_target=destination,
+            lane_center_reference=lane_center_reference,
+            object_snapshots=object_snapshots,
+            speed_upper_bound_mps=float(active_speed_upper_bound_mps),
+            reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
+            seed_state_traj=shifted_seed[0] if shifted_seed is not None else None,
+            seed_control_traj=shifted_seed[1] if shifted_seed is not None else None,
+        )
+
+        def _run_sequential_qp(
+            initial_x_ref_rollout: np.ndarray,
+            initial_u_ref_rollout: np.ndarray,
+        ) -> tuple[np.ndarray | None, np.ndarray | None, str, float, np.ndarray, np.ndarray]:
+            solve_time_total_ms = 0.0
+            current_x_rollout = np.asarray(initial_x_ref_rollout, dtype=float)
+            current_u_rollout = np.asarray(initial_u_ref_rollout, dtype=float)
+            best_x: np.ndarray | None = None
+            best_u: np.ndarray | None = None
+            status_text = "not_solved"
+
+            for iteration_idx in range(int(self.reference_sequential_iterations)):
+                P, q, A, l, u, index = self._build_qp(
+                    x0=x0,
+                    x_ref_target=destination,
+                    object_snapshots=object_snapshots,
+                    current_acceleration_mps2=float(planning_current_acceleration_mps2),
+                    current_steering_rad=float(current_steering_rad),
+                    x_ref_rollout=current_x_rollout,
+                    u_ref_rollout=current_u_rollout,
+                    lane_center_reference=lane_center_reference,
+                    speed_upper_bound_mps=float(active_speed_upper_bound_mps),
+                    reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
+                )
+                solution, status, solve_time_ms = self._solve_qp(P=P, q=q, A=A, l=l, u=u)
+                solve_time_total_ms += float(solve_time_ms)
+
+                if solution is None:
+                    if best_x is None:
+                        status_text = str(status)
+                    break
+
+                status_text = str(status)
+                best_x, best_u = self._extract_solution(solution=solution, index=index)
+                if int(iteration_idx) + 1 >= int(self.reference_sequential_iterations):
+                    break
+
+                current_x_rollout = np.asarray(best_x, dtype=float)
+                current_u_rollout = np.asarray(best_u, dtype=float)
+
+            return best_x, best_u, status_text, float(solve_time_total_ms), current_x_rollout, current_u_rollout
+
+        best_x_solution, best_u_solution, best_status, total_solve_time_ms, current_x_ref_rollout, current_u_ref_rollout = _run_sequential_qp(
+            initial_x_ref_rollout=np.asarray(x_ref_rollout, dtype=float),
+            initial_u_ref_rollout=np.asarray(u_ref_rollout, dtype=float),
+        )
+
+        solved_initially = best_x_solution is not None and best_u_solution is not None
+        if self._record_solver_failure_state(solved=bool(solved_initially)):
+            self._clear_all_solution_memory()
+            print(
+                "[MPC] Solver failed "
+                f"{int(self.reference_consecutive_solver_failure_reset_threshold)} consecutive replans; "
+                "clearing stored solution and retrying with a fresh rollout."
+            )
+            clean_x_ref_rollout, clean_u_ref_rollout = self._reference_rollout(
+                x0=x0,
+                x_ref_target=destination,
+                lane_center_reference=lane_center_reference,
+                object_snapshots=object_snapshots,
+                speed_upper_bound_mps=float(active_speed_upper_bound_mps),
+                reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
+                seed_state_traj=None,
+                seed_control_traj=None,
+            )
+            (
+                best_x_solution,
+                best_u_solution,
+                best_status,
+                clean_solve_time_ms,
+                current_x_ref_rollout,
+                current_u_ref_rollout,
+            ) = _run_sequential_qp(
+                initial_x_ref_rollout=np.asarray(clean_x_ref_rollout, dtype=float),
+                initial_u_ref_rollout=np.asarray(clean_u_ref_rollout, dtype=float),
+            )
+            total_solve_time_ms += float(clean_solve_time_ms)
+            self._record_clean_restart_result(
+                solved=bool(best_x_solution is not None and best_u_solution is not None)
+            )
+
+        self._last_status = str(best_status)
+        self._last_solve_time_ms = float(total_solve_time_ms)
+
+        if best_x_solution is None or best_u_solution is None:
+            x_solution, u_solution = self._fail_safe_fallback_trajectory(
+                x0=x0,
+                rollout_x=current_x_ref_rollout,
+                rollout_u=current_u_ref_rollout,
+                current_acceleration_mps2=float(planning_current_acceleration_mps2),
+            )
+        else:
+            x_solution = np.asarray(best_x_solution, dtype=float)
+            u_solution = np.asarray(best_u_solution, dtype=float)
+        x_solution = np.asarray(x_solution, dtype=float)
+        u_solution = np.asarray(u_solution, dtype=float)
+        for k in range(1, self.horizon_steps + 1):
+            stage_speed_upper_bound_mps = self._future_speed_upper_bound_mps(
+                active_speed_upper_bound_mps=float(active_speed_upper_bound_mps),
+                future_state_index=int(k),
+                reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
+            )
+            x_solution[k, 2] = self._clamp(
+                float(x_solution[k, 2]),
+                float(self.constraints.min_velocity_mps),
+                float(stage_speed_upper_bound_mps),
+            )
+            x_solution[k, 3] = self._wrap_angle(float(x_solution[k, 3]))
+
+        self._last_x_solution = np.asarray(x_solution, dtype=float)
+        self._last_u_solution = np.asarray(u_solution, dtype=float)
+
+        if best_x_solution is not None and best_u_solution is not None:
+            self._previous_x_solution = np.asarray(x_solution, dtype=float)
+            self._previous_u_solution = np.asarray(u_solution, dtype=float)
+
+        self._last_cost_terms = self._evaluate_plan_cost_terms(
+            x_traj=x_solution,
+            u_traj=u_solution,
+            x_ref_target=destination,
+            object_snapshots=object_snapshots,
+            current_acceleration_mps2=float(current_acceleration_mps2),
+            current_steering_rad=float(current_steering_rad),
+            lane_center_reference=lane_center_reference,
+        )
+
+        # Record whether this call was a stop goal so the next call can detect
+        # the stop→resume transition and avoid reusing the v=0 braking seed.
+        self._last_was_stop_goal = bool(_is_stop_goal)
+
+        output: List[List[float]] = []
+        for k in range(1, self.horizon_steps + 1):
+            output.append(
+                [
+                    float(x_solution[k, 0]),
+                    float(x_solution[k, 1]),
+                    float(x_solution[k, 2]),
+                    float(self._wrap_angle(float(x_solution[k, 3]))),
+                ]
+            )
+        return output
