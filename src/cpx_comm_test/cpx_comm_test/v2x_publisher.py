@@ -66,13 +66,17 @@ class V2XPublisher(Node):
 
             for item in payload.get("nearby_cavs", []):
                 tracked = TrackedObject()
+                
+                # Use the original vehicle ID so that this UUID matches the perception
+                # UUID when both sources report the same vehicle.
                 cav_id = str(
-                    item.get("id", item.get("vehicle_id", ""))
+                    item.get("vehicle_id", item.get("id", ""))
                 )
+
                 tracked.object_id.uuid = list(
                     uuid.uuid5(
                         uuid.NAMESPACE_URL,
-                        "cpx:v2x:{}".format(cav_id),
+                        "cpx:object:{}".format(cav_id),
                     ).bytes
                 )
 

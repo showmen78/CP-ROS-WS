@@ -2,10 +2,9 @@
 
 """Subscribe to and print all OpenCDA data published through ROS 2."""
 
-from autoware_perception_msgs.msg import PredictedObjects
-from autoware_perception_msgs.msg import TrafficLightGroupArray
 from autoware_perception_msgs.msg import TrackedObjects
 from cpx_interfaces.msg import CooperativeMessageArray
+from cpx_interfaces.msg import TrafficLightObservationArray
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
@@ -18,9 +17,9 @@ from .tcp_json_sender import TcpJsonSender
 # another input later without copying the subscription code.
 TOPICS = {
     "localization": (Odometry, "/cpx/localization"),
-    "perception": (PredictedObjects, "/cpx/perception"),
+    "perception": (TrackedObjects, "/cpx/perception"),
     "traffic_light": (
-        TrafficLightGroupArray,
+        TrafficLightObservationArray,
         "/cpx/traffic_light",
     ),
     "v2x": (TrackedObjects, "/cpx/v2x"),

@@ -9,6 +9,7 @@
 
   <depend>rclpy</depend>
   <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
   <depend>autoware_perception_msgs</depend>
   <depend>cpx_interfaces</depend>
   <depend>std_msgs</depend>

@@ -1,12 +1,13 @@
-"""Publish OpenCDA perception output as Autoware predicted objects."""
+"""Publish OpenCDA perception output as Autoware tracked objects."""
 
 import math
 import uuid
 
 from autoware_perception_msgs.msg import ObjectClassification
-from autoware_perception_msgs.msg import PredictedObject
-from autoware_perception_msgs.msg import PredictedObjects
 from autoware_perception_msgs.msg import Shape
+from autoware_perception_msgs.msg import TrackedObject
+from autoware_perception_msgs.msg import TrackedObjectKinematics
+from autoware_perception_msgs.msg import TrackedObjects
 import rclpy
 from rclpy.node import Node
 
@@ -42,12 +43,12 @@ def _classification_label(type_name):
 
 
 class PerceptionPublisher(Node):
-    """Receive perception JSON and publish predicted objects."""
+    """Receive perception JSON and publish tracked objects."""
 
     def __init__(self):
         super().__init__("perception_publisher")
         self.publisher = self.create_publisher(
-            PredictedObjects,
+            TrackedObjects,
             "/cpx/perception",
             10,
         )
@@ -57,7 +58,7 @@ class PerceptionPublisher(Node):
     def publish_messages(self):
         for data in self.receiver.get_messages():
             payload = data.get("data", data)
-            message = PredictedObjects()
+            message = TrackedObjects()
             timestamp_s = data.get(
                 "timestamp_s",
                 self.get_clock().now().nanoseconds / 1e9,
@@ -66,31 +67,32 @@ class PerceptionPublisher(Node):
             message.header.frame_id = str(data.get("frame_id", "map"))
 
             for item in payload.get("objects", []):
-                predicted = PredictedObject()
+                tracked = TrackedObject()
+                
+                # Use the original vehicle ID when possible. Perception and V2X then
+                # generate the same UUID when they report the same vehicle.
                 object_id = str(
-                    item.get("id", item.get("vehicle_id", ""))
+                    item.get("vehicle_id", item.get("id", ""))
                 )
-                predicted.object_id.uuid = list(
+
+                tracked.object_id.uuid = list(
                     uuid.uuid5(
                         uuid.NAMESPACE_URL,
-                        "cpx:perception:{}".format(object_id),
+                        "cpx:object:{}".format(object_id),
                     ).bytes
                 )
 
                 confidence = float(item.get("confidence", 1.0))
-                predicted.existence_probability = confidence
+                tracked.existence_probability = confidence
 
                 classification = ObjectClassification()
                 classification.label = _classification_label(
                     item.get("type", "")
                 )
                 classification.probability = confidence
-                predicted.classification = [classification]
+                tracked.classification = [classification]
 
-                pose = (
-                    predicted.kinematics
-                    .initial_pose_with_covariance.pose
-                )
+                pose = tracked.kinematics.pose_with_covariance.pose
                 pose.position.x = float(item.get("x", 0.0))
                 pose.position.y = float(item.get("y", 0.0))
                 pose.position.z = float(item.get("z", 0.0))
@@ -102,29 +104,29 @@ class PerceptionPublisher(Node):
                     yaw = float(yaw)
                     pose.orientation.z = math.sin(yaw / 2.0)
                     pose.orientation.w = math.cos(yaw / 2.0)
+                    tracked.kinematics.orientation_availability = (
+                        TrackedObjectKinematics.AVAILABLE
+                    )
 
                 speed = float(item.get("v", 0.0))
-                twist = (
-                    predicted.kinematics
-                    .initial_twist_with_covariance.twist
-                )
+                twist = tracked.kinematics.twist_with_covariance.twist
                 twist.linear.x = speed
+                tracked.kinematics.is_stationary = abs(speed) < 0.1
 
-                # OpenCDA currently sends no future trajectory. The
-                # variable-length ROS array is intentionally left empty.
-                predicted.kinematics.predicted_paths = []
-
-                predicted.shape.type = Shape.BOUNDING_BOX
-                predicted.shape.dimensions.x = float(
+                # This topic carries the measured/tracked state only. A
+                # separate tracker/predictor will later turn these objects
+                # into PredictedObjects for the planner.
+                tracked.shape.type = Shape.BOUNDING_BOX
+                tracked.shape.dimensions.x = float(
                     item.get("length_m") or 0.0
                 )
-                predicted.shape.dimensions.y = float(
+                tracked.shape.dimensions.y = float(
                     item.get("width_m") or 0.0
                 )
-                predicted.shape.dimensions.z = float(
+                tracked.shape.dimensions.z = float(
                     item.get("height_m") or 0.0
                 )
-                message.objects.append(predicted)
+                message.objects.append(tracked)
 
             self.publisher.publish(message)
 

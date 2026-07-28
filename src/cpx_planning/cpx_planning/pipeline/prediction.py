@@ -11,10 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Sequence
 
-# from behavior_planner.trajectory_risk import (
-#     lane_prediction_risk,
-#     obstacle_future_trajectory,
-# )
+from cpx_planning.behavior_planner.trajectory_risk import (
+    lane_prediction_risk,
+    obstacle_future_trajectory,
+)
 
 
 def _obstacle_id(snapshot: Mapping[str, object]) -> str:

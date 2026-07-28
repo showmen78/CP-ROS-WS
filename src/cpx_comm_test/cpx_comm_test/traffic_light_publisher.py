@@ -4,7 +4,8 @@ import zlib
 
 from autoware_perception_msgs.msg import TrafficLightElement
 from autoware_perception_msgs.msg import TrafficLightGroup
-from autoware_perception_msgs.msg import TrafficLightGroupArray
+from cpx_interfaces.msg import TrafficLightObservation
+from cpx_interfaces.msg import TrafficLightObservationArray
 import rclpy
 from rclpy.node import Node
 
@@ -28,12 +29,12 @@ def _group_id(value):
 
 
 class TrafficLightPublisher(Node):
-    """Receive traffic-light JSON and publish Autoware light groups."""
+    """Publish OpenCDA traffic lights without dropping their position."""
 
     def __init__(self):
         super().__init__("traffic_light_publisher")
         self.publisher = self.create_publisher(
-            TrafficLightGroupArray,
+            TrafficLightObservationArray,
             "/cpx/traffic_light",
             10,
         )
@@ -43,12 +44,13 @@ class TrafficLightPublisher(Node):
     def publish_messages(self):
         for data in self.receiver.get_messages():
             payload = data.get("data", data)
-            message = TrafficLightGroupArray()
+            message = TrafficLightObservationArray()
             timestamp_s = data.get(
                 "timestamp_s",
                 self.get_clock().now().nanoseconds / 1e9,
             )
-            _set_stamp(message.stamp, timestamp_s)
+            _set_stamp(message.header.stamp, timestamp_s)
+            message.header.frame_id = str(data.get("frame_id", "map"))
 
             colors = {
                 "red": TrafficLightElement.RED,
@@ -59,23 +61,33 @@ class TrafficLightPublisher(Node):
             }
 
             for item in payload.get("traffic_lights", []):
+                observation = TrafficLightObservation()
+                observation.source_id = str(item.get("id", ""))
+                observation.type = str(item.get("type", "traffic_light"))
+                observation.state = str(item.get("state", "unknown"))
+                position = item.get("position", {})
+                if isinstance(position, dict):
+                    observation.position.x = float(position.get("x", 0.0))
+                    observation.position.y = float(position.get("y", 0.0))
+                    observation.position.z = float(position.get("z", 0.0))
+
                 element = TrafficLightElement()
                 element.color = colors.get(
-                    str(item.get("state", "")).lower(),
+                    observation.state.strip().lower(),
                     TrafficLightElement.UNKNOWN,
                 )
                 element.shape = TrafficLightElement.CIRCLE
                 element.status = TrafficLightElement.SOLID_ON
-                element.confidence = float(
-                    item.get("confidence", 1.0)
-                )
+                observation.confidence = float(item.get("confidence", 1.0))
+                element.confidence = observation.confidence
 
                 group = TrafficLightGroup()
                 group.traffic_light_group_id = _group_id(
-                    item.get("id", 0)
+                    observation.source_id
                 )
                 group.elements = [element]
-                message.traffic_light_groups.append(group)
+                observation.signal = group
+                message.traffic_lights.append(observation)
 
             self.publisher.publish(message)
 

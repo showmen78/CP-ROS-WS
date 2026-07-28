@@ -1,12 +1,7 @@
-"""Publish CP lane events and traffic controls as typed ROS messages."""
+"""Publish CP lane events as typed ROS messages."""
 
-import zlib
-
-from autoware_perception_msgs.msg import TrafficLightElement
-from autoware_perception_msgs.msg import TrafficLightGroup
 from cpx_interfaces.msg import CooperativeMessageArray
 from cpx_interfaces.msg import LaneEvent
-from cpx_interfaces.msg import TrafficControl
 import rclpy
 from rclpy.node import Node
 
@@ -21,15 +16,6 @@ EVENT_TYPES = {
     "road_hazard": LaneEvent.ROAD_HAZARD,
     "work_zone": LaneEvent.WORK_ZONE,
 }
-
-SIGNAL_COLORS = {
-    "red": TrafficLightElement.RED,
-    "yellow": TrafficLightElement.AMBER,
-    "amber": TrafficLightElement.AMBER,
-    "green": TrafficLightElement.GREEN,
-    "white": TrafficLightElement.WHITE,
-}
-
 
 def _set_time(message_time, timestamp):
     """Copy seconds represented as a float into a ROS Time field."""
@@ -50,14 +36,6 @@ def _set_duration(duration, seconds):
     duration.nanosec = int((value - int(value)) * 1000000000)
 
 
-def _stable_group_id(value):
-    """Convert a string or integer control ID into a stable integer."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return int(zlib.crc32(str(value).encode("utf-8")))
-
-
 def _fill_position(point, raw_position):
     """Copy either a dictionary or an [x, y, z] list into a ROS Point."""
     if isinstance(raw_position, dict):
@@ -76,12 +54,12 @@ def _fill_position(point, raw_position):
 
 
 class CooperativeMessagePublisher(Node):
-    """Receive CP JSON and publish lane-event and traffic-control arrays."""
+    """Receive cooperative JSON and publish its lane events."""
 
     def __init__(self):
         super().__init__("cooperative_message_publisher")
 
-        # Both lane events and traffic controls travel together on this topic.
+        # Cooperative road and lane events travel on this topic.
         self.publisher = self.create_publisher(
             CooperativeMessageArray,
             "/cpx/cooperative_messages",
@@ -142,51 +120,8 @@ class CooperativeMessagePublisher(Node):
                 event.confidence = float(item.get("confidence", 1.0))
                 message.lane_events.append(event)
 
-            # The current CP payload calls this list "control". We also accept
-            # "traffic_controls" so the JSON can use the clearer ROS name.
-            controls = payload.get(
-                "traffic_controls",
-                payload.get("control", []),
-            )
-            for item in controls:
-                control = TrafficControl()
-                control.id = str(item.get("id", ""))
-                control.source = str(item.get("source", ""))
-                _set_time(
-                    control.source_stamp,
-                    item.get("timestamp_s", timestamp),
-                )
-                _set_duration(control.ttl, item.get("ttl_s", 0.0))
-                control.confidence = float(
-                    item.get("confidence", 1.0)
-                )
-
-                # Reuse Autoware's traffic-light format inside our custom
-                # wrapper instead of defining another red/yellow/green format.
-                signal = TrafficLightGroup()
-                signal.traffic_light_group_id = _stable_group_id(
-                    item.get("control_id", item.get("id", 0))
-                )
-
-                element = TrafficLightElement()
-                state = str(
-                    item.get(
-                        "signal_state",
-                        item.get("state", ""),
-                    )
-                ).strip().lower()
-                element.color = SIGNAL_COLORS.get(
-                    state,
-                    TrafficLightElement.UNKNOWN,
-                )
-                element.shape = TrafficLightElement.CIRCLE
-                element.status = TrafficLightElement.SOLID_ON
-                element.confidence = control.confidence
-                signal.elements = [element]
-                control.signal = signal
-                message.traffic_controls.append(control)
-
-            # Subscribers receive the lane and traffic-control update together.
+            # Traffic-light observations use their own perception topic. The
+            # traffic_controls field therefore remains empty for now.
             self.publisher.publish(message)
 
     def destroy_node(self):

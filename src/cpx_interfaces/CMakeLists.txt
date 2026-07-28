@@ -12,6 +12,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/LaneEvent.msg"
   "msg/TrafficControl.msg"
   "msg/CooperativeMessageArray.msg"
+  "msg/TrafficLightObservation.msg"
+  "msg/TrafficLightObservationArray.msg"
   DEPENDENCIES
     autoware_perception_msgs
     builtin_interfaces
