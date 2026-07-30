@@ -1,9 +1,11 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+
 <package format="3">
   <name>cpx_comm_test</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Communication between OpenCDA and ROS 2</description>
+
   <maintainer email="showmen.dey78@gmail.com">umd-user</maintainer>
   <license>Apache-2.0</license>
 
@@ -13,6 +15,10 @@
   <depend>autoware_perception_msgs</depend>
   <depend>cpx_interfaces</depend>
   <depend>std_msgs</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

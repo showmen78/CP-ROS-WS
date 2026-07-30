@@ -545,6 +545,7 @@ class RuleBasedBehaviorPlanner:
         nearest_front_obstacles_by_lane: Mapping[int, Mapping[str, object]] | None = None,
         lane_prediction_risks: Mapping[int, Mapping[str, object]] | None = None,
         preferred_target_lane_id: int | None = None,
+        lane_closure_messages: Sequence[Mapping[str, object]] | None = None,
     ) -> BehaviorCommand:
         """
         Run one planning cycle.
@@ -637,7 +638,6 @@ class RuleBasedBehaviorPlanner:
         if str(planner_mode) != str(self._last_mode):
             self._reset_lane_change_state(reason="reset")
         self._last_mode = str(planner_mode)
-
         (
             cp_lane_closure_messages,
             cp_control_messages,
@@ -645,6 +645,7 @@ class RuleBasedBehaviorPlanner:
         ) = self._cooperative_messages(
             current_time_s=current_time_s,
             wall_time_s=wall_time_s,
+            lane_closure_messages=lane_closure_messages,
         )
         reroute_messages = self._poll_cooperative_messages(
             current_messages=cp_lane_closure_messages,
@@ -1533,7 +1534,20 @@ class RuleBasedBehaviorPlanner:
         *,
         current_time_s: float | None,
         wall_time_s: float | None,
+        lane_closure_messages: Sequence[Mapping[str, object]] | None = None,
     ) -> tuple[list[dict], list[dict], bool]:
+        
+        # ROS supplies lane events directly, so no JSON file is needed in the ROS planning package.
+        if lane_closure_messages is not None:
+            self._cached_lane_closure_messages = [dict(message) for message in list(lane_closure_messages or [])
+                if isinstance(message, Mapping)
+                and str(message.get("id", "")).strip()
+                and str(message.get("type", "")).strip().lower() == "lane_closure"
+                and str(message.get("id", "")).strip() not in self._acknowledged_reroute_ids
+            ]
+            self._cached_control_messages = []
+            return [dict(message) for message in self._cached_lane_closure_messages], [], True
+        
         if not self._cp_message_path:
             return [], [], False
 

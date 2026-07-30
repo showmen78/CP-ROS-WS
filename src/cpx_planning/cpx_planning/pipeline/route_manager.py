@@ -391,6 +391,24 @@ class CPXRouteManager:
     def last_status(self) -> RouteManagerStatus:
         """Return the most recently calculated route status object."""
         return self._last_status
+    
+    @property
+    def goal_point(self) -> Optional[Dict[str, float]]:
+        """Return a copy of the original final destination used by the active route."""
+        return None if self._goal_point is None else dict(self._goal_point)
+
+    def accept_route_summary(self, summary: Any) -> bool:
+        """Replace the route manager's active route only when rerouting produced a valid route."""
+        if not bool(getattr(summary, "route_found", False)):
+            return False
+        if len(list(getattr(summary, "route_waypoints", []) or [])) < 2:
+            return False
+
+        self._active_route_summary = summary
+        self._fallback_route_points = []
+        self._build_route_nodes(summary)
+        self._last_status = self._status_from_summary(summary)
+        return True
 
     def _route_nodes(self) -> List[Tuple[float, float, float, Any, str]]:
         """Return a copy of the saved route nodes so callers cannot replace the internal list."""

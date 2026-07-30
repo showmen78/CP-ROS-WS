@@ -21,7 +21,7 @@ setup(
     },
     include_package_data=True,
     
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'numpy', 'scipy', 'osqp', 'PyYAML'],
     zip_safe=True,
     maintainer='umd-user',
     maintainer_email='showmen.dey78@gmail.com',
