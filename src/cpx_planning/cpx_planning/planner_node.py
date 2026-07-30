@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import json
+from std_msgs.msg import String
 
 from autoware_perception_msgs.msg import TrackedObjects
+from autoware_control_msgs.msg import Control
 from cpx_interfaces.msg import CooperativeMessageArray, TrafficLightObservationArray
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
@@ -25,6 +28,7 @@ from cpx_planning.MPC import MPC
 from cpx_planning.pipeline.control_buffer import MPCControlBuffer
 from cpx_planning.pipeline.mpc_feedback import BehaviorMPCFeedback
 from cpx_planning.utility.config_loader import load_yaml_file
+from cpx_planning.ros_output_adapter import ROSOutputAdapter
 
 
 class CPXPlannerNode(Node):
@@ -87,6 +91,8 @@ class CPXPlannerNode(Node):
         self.declare_parameter("full_candidate_pipeline_enabled", True)
         self.declare_parameter("full_candidate_reference_min_object_distance_m", 2.0)
         self.declare_parameter("strict_decision_ownership_enabled", True)
+        
+        self.declare_parameter("control_topic", "/control/command/control_cmd")
 
         xodr_path = str(self.get_parameter("xodr_path").value)
         cache_root = str(self.get_parameter("cache_root").value)
@@ -100,6 +106,7 @@ class CPXPlannerNode(Node):
         road_cfg.setdefault("lane_width_m", float(self.get_parameter("lane_width_m").value))
         
         self.latest_planner_output = None
+        self.latest_control_message = None
 
         if not Path(xodr_path).is_file():
             raise FileNotFoundError("OpenDRIVE map not found: {}".format(xodr_path))
@@ -176,6 +183,12 @@ class CPXPlannerNode(Node):
             behavior_runtime_cfg=self.behavior_runtime_cfg,
             config=behavior_config,
         )
+        
+        
+        control_topic = str(self.get_parameter("control_topic").value)
+        self.ros_output_adapter = ROSOutputAdapter()
+        self.control_publisher = self.create_publisher(Control, control_topic, 10)
+        self.shadow_output_publisher = self.create_publisher(String, "/cpx/planner_shadow_output", 10)
 
         self.localization_subscription = self.create_subscription(
             Odometry, "/cpx/localization", self.input_adapter.update_localization, 10
@@ -209,6 +222,66 @@ class CPXPlannerNode(Node):
 
         self.create_timer(0.05, self.build_planner_input)
         self.get_logger().info("CP-X planner node is waiting for ROS inputs.")
+        
+        
+    def publish_shadow_output(self, adapter_output, planner_output):
+        """Send the ROS planner input summary and output back for comparison."""
+        frame = adapter_output.frame
+        diagnostics = planner_output.diagnostics.as_dict()
+
+        object_ids = sorted(
+            str(dict(item).get("id", dict(item).get("vehicle_id", "")))
+            for item in list(frame.perception.planning_objects or [])
+            if isinstance(item, dict)
+        )
+
+        reference_xy = [
+            [
+                float(dict(sample).get("x_ref_m", dict(sample).get("x", 0.0))),
+                float(dict(sample).get("y_ref_m", dict(sample).get("y", 0.0))),
+            ]
+            for sample in list(planner_output.reference_trajectory or [])
+            if isinstance(sample, dict)
+        ]
+
+        planned_trajectory = [
+            [float(value) for value in list(state)[:4]]
+            for state in list(planner_output.planned_trajectory or [])
+        ]
+
+        payload = {
+            "schema_version": 1,
+            "cycle_time_s": float(frame.planning.sim_time_s),
+            "input": {
+                "ego_state": [
+                    float(frame.planning.ego.x_m),
+                    float(frame.planning.ego.y_m),
+                    float(frame.planning.ego.speed_mps),
+                    float(frame.planning.ego.heading_rad),
+                ],
+                "current_lane_id": int(frame.map_lane.lane_id),
+                "object_ids": object_ids,
+                "object_count": int(frame.perception.planning_count),
+                "predicted_object_count": int(frame.prediction.predicted_object_count),
+                "v2x_obstacle_count": int(frame.cp_messages.obstacle_count),
+                "traffic_signal_state": str(frame.planning.traffic_control.signal_state),
+                "route_point_count": len(adapter_output.route_points),
+            },
+            "behavior": planner_output.behavior_command.as_dict(),
+            "mpc": {
+                "acceleration_mps2": float(planner_output.acceleration_mps2),
+                "steering_rad": float(planner_output.steering_rad),
+                "status": str(diagnostics.get("mpc_status", "")),
+                "fallback_reason": str(diagnostics.get("mpc_fallback_reason", "")),
+                "replan_executed": bool(diagnostics.get("mpc_replan_executed", False)),
+            },
+            "reference_xy": reference_xy,
+            "planned_trajectory": planned_trajectory,
+        }
+
+        message = String()
+        message.data = json.dumps(payload, allow_nan=False, separators=(",", ":"))
+        self.shadow_output_publisher.publish(message)
 
     def build_planner_input(self):
         """Build and print one new PlannerInputFrame after all required ROS inputs have arrived."""
@@ -241,6 +314,14 @@ class CPXPlannerNode(Node):
             return
         
         self.latest_planner_output = planner_output
+        self.publish_shadow_output(adapter_output, planner_output)
+        control_message = self.ros_output_adapter.build_control_message(planner_output=planner_output, stamp=self.get_clock().now().to_msg())
+        self.control_publisher.publish(control_message)
+        self.latest_control_message = control_message
+        
+        
+        
+        
         behavior_command = planner_output.behavior_command.as_dict()
         destination_state = list(self.planning_pipeline.last_destination_state or [])
         lane_center_reference = [dict(sample) for sample in planner_output.reference_trajectory]

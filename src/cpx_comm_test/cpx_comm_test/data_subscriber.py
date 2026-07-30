@@ -8,7 +8,7 @@ from cpx_interfaces.msg import TrafficLightObservationArray
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
-
+from std_msgs.msg import String
 from .tcp_json_sender import ros_message_to_dict
 from .tcp_json_sender import TcpJsonSender
 
@@ -27,6 +27,7 @@ TOPICS = {
         CooperativeMessageArray,
         "/cpx/cooperative_messages",
     ),
+    "planner_shadow_output": (String, "/cpx/planner_shadow_output"),
 }
 
 
@@ -59,9 +60,10 @@ class DataSubscriber(Node):
     def print_message(self, data_type, message):
         """Print one typed ROS message and send a JSON copy to OpenCDA."""
         # ROS already formats typed messages in a readable field-by-field form.
-        self.get_logger().info(
-            "{} data:\n{}".format(data_type, message)
-        )
+        if data_type == "planner_shadow_output":
+            self.get_logger().info("ROS planner shadow output received.")
+        else:
+            self.get_logger().info("{} data:\n{}".format(data_type, message))
 
         # Give each forwarded update a number so its order is easy to check.
         self.sequence += 1
@@ -74,7 +76,9 @@ class DataSubscriber(Node):
             "message_type": data_type,
             "data": ros_message_to_dict(message),
         }
-        self.sender.send(forwarded_data)
+        
+        if data_type== "planner_shadow_output":
+            self.sender.send(forwarded_data)
 
     def destroy_node(self):
         """Close the TCP connection before shutting down the ROS node."""

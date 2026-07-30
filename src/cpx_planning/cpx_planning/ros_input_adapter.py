@@ -113,14 +113,19 @@ class ROSInputAdapter:
         self._final_destination = message
 
     def ready(self):
-        """Return True after every regularly required ROS input has arrived at least once."""
-        return (
-            self._localization is not None
-            and self._perception is not None
-            and self._v2x is not None
-            and self._traffic_lights is not None
-            and self._final_destination is not None
-        )
+        """Return True only when the required ROS inputs belong to the same CARLA cycle."""
+        if self._localization is None or self._perception is None or self._v2x is None or self._traffic_lights is None or self._final_destination is None:
+            return False
+
+        timestamps = [
+            self._stamp_seconds(self._localization.header.stamp),
+            self._stamp_seconds(self._perception.header.stamp),
+            self._stamp_seconds(self._v2x.header.stamp),
+            self._stamp_seconds(self._traffic_lights.header.stamp),
+            self._stamp_seconds(self._final_destination.header.stamp),
+        ]
+
+        return max(timestamps) - min(timestamps) <= 1.0e-6
 
     def build(self):
         """Convert the latest ROS messages and build one complete PlannerInputFrame."""
