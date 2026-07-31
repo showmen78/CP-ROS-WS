@@ -55,22 +55,20 @@ class ROSInputAdapter:
         route_manager,
         tracker,
         lane_safety_scorer,
-        prediction_horizon_s=3.0,
-        prediction_dt_s=0.2,
+        mpc,
         min_front_gap_m=8.0,
-        min_rear_gap_m=8.0,
         min_ttc_s=2.0,
+        communication_range_m=80.0,
     ):
         """Store the planner components, prediction settings, and latest-message placeholders."""
         self.map_planner = map_planner
         self.route_manager = route_manager
         self.tracker = tracker
         self.lane_safety_scorer = lane_safety_scorer
-        self.prediction_horizon_s = float(prediction_horizon_s)
-        self.prediction_dt_s = float(prediction_dt_s)
+        self.mpc = mpc
         self.min_front_gap_m = float(min_front_gap_m)
-        self.min_rear_gap_m = float(min_rear_gap_m)
         self.min_ttc_s = float(min_ttc_s)
+        self.communication_range_m = max(0.0, float(communication_range_m))
 
         self._localization = None
         self._perception = None
@@ -190,12 +188,26 @@ class ROSInputAdapter:
             else str(route_summary.get("debug_reason", "custom_global_route_unavailable"))
         )
 
-        signal_context, stop_target, selected_signal = self._select_traffic_light(
-            traffic_lights=snapshot.traffic_lights,
+        traffic_controls = [
+            control
+            for control in (
+                self._traffic_light_to_control_message(
+                    traffic_light=traffic_light,
+                    ego_pose=ego_pose,
+                    sim_time_s=float(snapshot.timestamp_s),
+                )
+                for traffic_light in snapshot.traffic_lights
+            )
+            if control is not None
+        ]
+        selected_control = self._select_relevant_traffic_control(
+            traffic_controls=traffic_controls,
             ego_pose=ego_pose,
             current_lane_id=current_lane_id,
             current_road_id=int(getattr(ego_waypoint, "road_id", 0) or 0),
+            sim_time_s=float(snapshot.timestamp_s),
         )
+        signal_context, stop_target = self._traffic_context_from_control(selected_control=selected_control, ego_pose=ego_pose)
         traffic_control_context = TrafficControlContext.from_signal_context(
             signal_context=signal_context,
             stop_target=stop_target,
@@ -232,10 +244,10 @@ class ROSInputAdapter:
             ego_snapshot=ego_snapshot,
             lane_assignments=lane_assignments,
             available_lane_ids=lane_ids,
-            horizon_s=self.prediction_horizon_s,
-            dt_s=self.prediction_dt_s,
+            horizon_s=float(self.mpc.horizon_s),
+            dt_s=float(self.mpc.dt_s),
             min_front_gap_m=self.min_front_gap_m,
-            min_rear_gap_m=self.min_rear_gap_m,
+            min_rear_gap_m=self.min_front_gap_m,
             min_ttc_s=self.min_ttc_s,
         )
 
@@ -247,11 +259,6 @@ class ROSInputAdapter:
             remaining_points_count=len(route_points),
             route_found=bool(route_summary.get("route_found", False)),
         )
-        final_goal = [
-            float(snapshot.final_goal["x"]),
-            float(snapshot.final_goal["y"]),
-            float(snapshot.final_goal.get("z", 0.0)),
-        ]
         frame = PlannerInputFrame(
             planning=PlanningContext(
                 sim_time_s=float(snapshot.timestamp_s),
@@ -267,7 +274,7 @@ class ROSInputAdapter:
                 ),
                 route=route_context,
                 traffic_control=traffic_control_context,
-                targets=TargetContext(stop_target=traffic_control_context.stop_target, final_goal=final_goal),
+                targets=TargetContext(stop_target=traffic_control_context.stop_target),
                 global_route_reference_allowed=route_reference_allowed,
                 global_route_reference_gate_reason=route_reference_gate_reason,
             ),
@@ -291,15 +298,16 @@ class ROSInputAdapter:
                 lane_prediction_risks=dict(prediction_frame.lane_prediction_risks),
                 obstacle_future_trajectories=dict(prediction_frame.obstacle_future_trajectories),
                 model="constant_acceleration",
-                horizon_s=self.prediction_horizon_s,
-                dt_s=self.prediction_dt_s,
+                horizon_s=float(self.mpc.horizon_s),
+                dt_s=float(self.mpc.dt_s),
             ),
             cp_messages=CPMessageContext(
                 message_path="",
-                traffic_controls=[],
-                selected_traffic_control=None,
+                traffic_controls=[dict(item) for item in traffic_controls],
+                selected_traffic_control=selected_control,
                 lane_closures=[dict(item) for item in snapshot.lane_events],
                 obstacles=[dict(item) for item in snapshot.v2x_objects],
+                generated_traffic_light_control=selected_control,
             ),
         )
 
@@ -320,7 +328,7 @@ class ROSInputAdapter:
             route_optimal_lane_id=route_optimal_lane_id,
             route_reference_allowed=route_reference_allowed,
             route_reference_gate_reason=route_reference_gate_reason,
-            selected_traffic_control=selected_signal,
+            selected_traffic_control=selected_control,
             signal_context=dict(signal_context),
             stop_target=stop_target,
             source_quality={
@@ -737,94 +745,130 @@ class ROSInputAdapter:
             if math.isfinite(float(distance))
         }
 
-    def _select_traffic_light(
-        self,
-        *,
-        traffic_lights,
-        ego_pose,
-        current_lane_id,
-        current_road_id,
-    ):
-        """Select the most relevant forward traffic light and create its signal context and stop target."""
-        best = None
-        ego_heading = float(ego_pose["heading_rad"])
-        cos_heading = math.cos(ego_heading)
-        sin_heading = math.sin(ego_heading)
-
-        for signal in traffic_lights:
-            position = dict(signal.get("position", {}))
-            dx = float(position.get("x", 0.0)) - float(ego_pose["x"])
-            dy = float(position.get("y", 0.0)) - float(ego_pose["y"])
-            forward_m = cos_heading * dx + sin_heading * dy
-            lateral_m = -sin_heading * dx + cos_heading * dy
-
-            # A light already behind the ego should not control the next motion.
-            if forward_m < -1.0:
-                continue
-
-            waypoint = self.map_planner.get_waypoint(position)
-            if waypoint is None:
-                continue
-
-            signal_lane_id = int(canonical_lane_id_for_waypoint(waypoint))
-            signal_road_id = int(getattr(waypoint, "road_id", 0) or 0)
-            road_mismatch = int(
-                bool(current_road_id) and bool(signal_road_id) and signal_road_id != current_road_id
-            )
-            lane_mismatch = int(
-                bool(current_lane_id) and bool(signal_lane_id) and signal_lane_id != current_lane_id
-            )
-            score = (road_mismatch, lane_mismatch, abs(float(lateral_m)), max(0.0, float(forward_m)))
-            if best is None or score < best[0]:
-                best = (score, dict(signal), waypoint, forward_m, lateral_m)
-
-        if best is None:
-            return (
-                {
-                    "signal_state": "unknown",
-                    "signal_source": "ros_perception",
-                    "from_cp": False,
-                    "traffic_control_from_cp": False,
-                    "confidence": 0.0,
-                },
-                None,
-                None,
-            )
-
-        _, signal, waypoint, forward_m, lateral_m = best
-        position = dict(signal["position"])
-        distance_m = math.hypot(
-            float(position["x"]) - float(ego_pose["x"]),
-            float(position["y"]) - float(ego_pose["y"]),
-        )
-        lane_id = int(canonical_lane_id_for_waypoint(waypoint))
-        road_id = int(getattr(waypoint, "road_id", 0) or 0)
-        section_id = int(getattr(waypoint, "section_id", 0) or 0)
-        heading_rad = world_heading_rad(waypoint)
-        stop_target = {
-            "x_m": float(position["x"]),
-            "y_m": float(position["y"]),
-            "heading_rad": ego_pose["heading_rad"] if heading_rad is None else float(heading_rad),
-            "lane_id": lane_id,
-            "road_id": road_id,
-            "section_id": section_id,
-            "distance_m": float(distance_m),
-            "source": "ros_perception_traffic_light",
+    def _traffic_light_to_control_message(self, *, traffic_light, ego_pose, sim_time_s):
+        """Build the same internal traffic-control fields as OpenCDA, using only perception data and the custom map."""
+        position = dict(traffic_light.get("position", {}))
+        if "x" not in position or "y" not in position:
+            return None
+        dx_m = float(position["x"]) - float(ego_pose["x"])
+        dy_m = float(position["y"]) - float(ego_pose["y"])
+        distance_m = math.hypot(dx_m, dy_m)
+        if self.communication_range_m > 0.0 and distance_m > self.communication_range_m:
+            return None
+        ego_heading_rad = float(ego_pose["heading_rad"])
+        forward_m = math.cos(ego_heading_rad) * dx_m + math.sin(ego_heading_rad) * dy_m
+        lateral_m = -math.sin(ego_heading_rad) * dx_m + math.cos(ego_heading_rad) * dy_m
+        waypoint = self.map_planner.get_waypoint(position)
+        lane_id = int(canonical_lane_id_for_waypoint(waypoint)) if waypoint is not None else 0
+        road_id = int(getattr(waypoint, "road_id", 0) or 0) if waypoint is not None else 0
+        section_id = int(getattr(waypoint, "section_id", 0) or 0) if waypoint is not None else 0
+        map_heading_rad = world_heading_rad(waypoint) if waypoint is not None else None
+        heading_rad = ego_heading_rad if map_heading_rad is None else float(map_heading_rad)
+        state = str(traffic_light.get("state", "unknown") or "unknown").strip().lower()
+        confidence = float(traffic_light.get("confidence", 1.0 if state in {"red", "yellow", "green"} else 0.3))
+        stop_line = {"x_m": float(position["x"]), "y_m": float(position["y"]), "heading_rad": heading_rad, "lane_id": lane_id, "road_id": road_id, "section_id": section_id}
+        ttl_s = max(0.2, 2.0 * float(self.mpc.dt_s))
+        control_id = str(traffic_light.get("id", ""))
+        return {
+            "type": "traffic_light",
+            "id": "native_opencda_tl:{}".format(control_id),
+            "state": state,
+            "signal_state": state,
+            "control_id": control_id,
+            "timestamp_s": float(sim_time_s),
+            "ttl_s": ttl_s,
+            "valid_until_s": float(sim_time_s) + ttl_s,
+            "confidence": confidence,
+            "distance_m": distance_m,
+            "stop_line": dict(stop_line),
+            "stop_line_position": dict(stop_line),
+            "valid_range": {
+                "search_distance_m": float(self.communication_range_m),
+                "forward_m": forward_m,
+                "lateral_m": lateral_m,
+                "signal_forward_m": forward_m,
+                "signal_lateral_m": lateral_m,
+                "road_id": road_id,
+                "section_id": section_id,
+                "lane_id": lane_id,
+            },
+            "ego_passed_stop_line": bool(forward_m < -1.0),
+            "source": "native_opencda",
+            "provider_source": "native_opencda_traffic_light",
+            "signal_actor_id": control_id,
+            "signal_actor_name": str(traffic_light.get("type", "")),
+            "signal_actor_raw_state": str(traffic_light.get("state", "unknown")),
+            "signal_distance_m": distance_m,
+            "signal_forward_m": forward_m,
+            "signal_lateral_m": lateral_m,
         }
-        signal_context = {
-            "signal_state": str(signal.get("state", "unknown")),
-            "signal_source": "ros_perception",
-            "source": "ros_perception",
-            "control_id": str(signal.get("id", "")),
-            "provider_source": "opencda_perception_ros",
-            "from_cp": False,
-            "traffic_control_from_cp": False,
-            "confidence": float(signal.get("confidence", 0.0)),
-            "ego_passed_stop_line": False,
-            "signal_forward_m": float(forward_m),
-            "signal_lateral_m": float(lateral_m),
+
+    def _select_relevant_traffic_control(self, *, traffic_controls, ego_pose, current_lane_id, current_road_id, sim_time_s):
+        """Select the relevant unpassed traffic light with the same scoring order used by OpenCDA."""
+        best_control = None
+        best_score = None
+        cos_h = math.cos(float(ego_pose["heading_rad"]))
+        sin_h = math.sin(float(ego_pose["heading_rad"]))
+        for control in list(traffic_controls or []):
+            if not isinstance(control, Mapping) or not self._cp_message_is_fresh(control, sim_time_s=float(sim_time_s)):
+                continue
+            stop_line = control.get("stop_line_position", control.get("stop_line"))
+            if not isinstance(stop_line, Mapping):
+                continue
+            x_value = stop_line.get("x", stop_line.get("x_m"))
+            y_value = stop_line.get("y", stop_line.get("y_m"))
+            if x_value is None or y_value is None:
+                continue
+            dx_m = float(x_value) - float(ego_pose["x"])
+            dy_m = float(y_value) - float(ego_pose["y"])
+            forward_m = cos_h * dx_m + sin_h * dy_m
+            lateral_m = -sin_h * dx_m + cos_h * dy_m
+            if bool(control.get("ego_passed_stop_line", False)) or forward_m < -1.0:
+                continue
+            stop_lane_id = int(float(control.get("lane_id", stop_line.get("lane_id", 0)) or 0))
+            stop_road_id = int(float(control.get("road_id", stop_line.get("road_id", 0)) or 0))
+            road_mismatch = 1.0 if stop_road_id and current_road_id and stop_road_id != current_road_id else 0.0
+            lane_mismatch = 1.0 if stop_lane_id and current_lane_id and stop_lane_id != current_lane_id else 0.0
+            score = (road_mismatch, lane_mismatch, abs(lateral_m) + 0.01 * forward_m)
+            if best_score is None or score < best_score:
+                best_control = control
+                best_score = score
+        return best_control
+
+    @staticmethod
+    def _traffic_context_from_control(*, selected_control, ego_pose):
+        """Convert the selected internal control into the same signal context and stop target used by OpenCDA."""
+        if not isinstance(selected_control, Mapping):
+            return {"signal_state": "unknown", "from_cp": False}, None
+        state = str(selected_control.get("signal_state", selected_control.get("state", "unknown")) or "unknown").strip().lower()
+        stop_line = selected_control.get("stop_line_position", selected_control.get("stop_line"))
+        stop_target = None
+        if isinstance(stop_line, Mapping):
+            x_value = stop_line.get("x", stop_line.get("x_m"))
+            y_value = stop_line.get("y", stop_line.get("y_m"))
+            if x_value is not None and y_value is not None:
+                stop_target = {
+                    "x_m": float(x_value),
+                    "y_m": float(y_value),
+                    "lane_id": int(float(selected_control.get("lane_id", stop_line.get("lane_id", 0)) or 0)),
+                    "road_id": int(float(selected_control.get("road_id", stop_line.get("road_id", 0)) or 0)),
+                    "distance_m": math.hypot(float(x_value) - float(ego_pose["x"]), float(y_value) - float(ego_pose["y"])),
+                    "source": "opencda_cp_control",
+                }
+        context = {
+            "signal_state": state,
+            "signal_source": str(selected_control.get("source", "opencda_cp")),
+            "source": str(selected_control.get("source", "opencda_cp")),
+            "cp_control_id": str(selected_control.get("control_id", selected_control.get("id", ""))),
+            "control_id": str(selected_control.get("control_id", selected_control.get("id", ""))),
+            "cp_provider_source": str(selected_control.get("provider_source", "")),
+            "provider_source": str(selected_control.get("provider_source", "")),
+            "from_cp": True,
+            "traffic_control_from_cp": True,
+            "confidence": float(selected_control.get("confidence", 1.0) or 0.0),
+            "ego_passed_stop_line": bool(selected_control.get("ego_passed_stop_line", False)),
         }
-        return signal_context, stop_target, signal
+        return context, stop_target
 
     @staticmethod
     def _stamp_seconds(stamp):

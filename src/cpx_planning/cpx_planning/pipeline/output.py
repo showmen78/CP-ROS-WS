@@ -7,6 +7,15 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 
 @dataclass(frozen=True)
+class PlannerControl:
+    """CARLA-independent form of the throttle, brake, and normalized steering command used inside the original pipeline."""
+
+    throttle: float = 0.0
+    brake: float = 0.0
+    steer: float = 0.0
+
+
+@dataclass(frozen=True)
 class BehaviorCommand:
     """Behavior-layer decision exposed in PlannerOutput."""
 

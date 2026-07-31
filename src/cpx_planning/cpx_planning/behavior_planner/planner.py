@@ -1537,16 +1537,16 @@ class RuleBasedBehaviorPlanner:
         lane_closure_messages: Sequence[Mapping[str, object]] | None = None,
     ) -> tuple[list[dict], list[dict], bool]:
         
-        # ROS supplies lane events directly, so no JSON file is needed in the ROS planning package.
+        # ROS supplies lane events directly, but keep the same polling period and cache used by OpenCDA.
         if lane_closure_messages is not None:
-            self._cached_lane_closure_messages = [dict(message) for message in list(lane_closure_messages or [])
-                if isinstance(message, Mapping)
-                and str(message.get("id", "")).strip()
-                and str(message.get("type", "")).strip().lower() == "lane_closure"
-                and str(message.get("id", "")).strip() not in self._acknowledged_reroute_ids
-            ]
-            self._cached_control_messages = []
-            return [dict(message) for message in self._cached_lane_closure_messages], [], True
+            refreshed = self._should_check_cooperative_messages(current_time_s=current_time_s, wall_time_s=wall_time_s)
+            if refreshed:
+                self._cached_lane_closure_messages = [dict(message) for message in list(lane_closure_messages or []) if isinstance(message, Mapping) and str(message.get("id", "")).strip() and str(message.get("type", "")).strip().lower() == "lane_closure" and str(message.get("id", "")).strip() not in self._acknowledged_reroute_ids]
+                self._cached_control_messages = []
+                check_time_s = self._cooperative_message_check_reference_time_s(current_time_s=current_time_s, wall_time_s=wall_time_s)
+                if check_time_s is not None:
+                    self._last_cp_message_check_time_s = float(check_time_s)
+            return [dict(message) for message in self._cached_lane_closure_messages], [], bool(refreshed)
         
         if not self._cp_message_path:
             return [], [], False

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Tuple
 
+from cpx_planning.pipeline.output import PlannerControl
+
 
 class SafetySupervisor:
     """Filter planner controls before OpenCDA applies them."""
@@ -26,7 +28,6 @@ class SafetySupervisor:
         self,
         *,
         control: Any,
-        carla_module: Any,
         safety_manager: Any = None,
         input_frame: Any = None,
         behavior_decision: str = "",
@@ -50,13 +51,13 @@ class SafetySupervisor:
             if not filtered_hazard:
                 self._last_control = control
                 return control, "safety_supervisor_release:" + str(hazard_reason)
-            safe = carla_module.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
+            safe = PlannerControl(throttle=0.0, brake=1.0, steer=0.0)
             self._last_control = safe
             return safe, "safety_supervisor_emergency_stop:" + filtered_hazard
         if self._last_control is None:
             self._last_control = control
             return control, ""
-        filtered = carla_module.VehicleControl(
+        filtered = PlannerControl(
             throttle=self._limit_delta(
                 float(getattr(control, "throttle", 0.0)),
                 float(getattr(self._last_control, "throttle", 0.0)),
