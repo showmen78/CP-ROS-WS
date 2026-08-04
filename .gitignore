@@ -46,5 +46,6 @@ env/
 /src/cpx_planning/cpx_planning/planner_core/debug/
 /src/cpx_planning/cpx_planning/behavior_planner/cp_message.json
 *.log
+*.jsonl
 
 /src/cpx_planning/test/

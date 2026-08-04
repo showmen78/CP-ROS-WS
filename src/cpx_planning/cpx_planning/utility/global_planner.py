@@ -548,7 +548,9 @@ class CustomGlobalPlannerAdapter:
             )
             delta = _wrap_angle(after - before)
             if abs(delta) >= math.radians(28.0):
-                option = "LEFT" if delta > 0.0 else "RIGHT"
+                # Route points use CARLA/world coordinates, where the y axis has the opposite sign from the
+                # ENU coordinates used internally by AD-map. Match OpenCDA's RoadOption left/right meaning.
+                option = "RIGHT" if delta > 0.0 else "LEFT"
             elif abs(delta) >= math.radians(10.0):
                 option = "STRAIGHT"
             else:
@@ -559,14 +561,15 @@ class CustomGlobalPlannerAdapter:
 
     @staticmethod
     def _next_macro_maneuver(options: Sequence[str], start_index: int) -> str:
-        labels = {
-            "LEFT": "Turn Left",
-            "RIGHT": "Turn Right",
-            "STRAIGHT": "Continue Straight",
-        }
-        for option in options[max(0, int(start_index)):]:
-            if str(option).upper() in labels:
-                return labels[str(option).upper()]
+        normalized = [str(option).strip().upper() for option in list(options[max(0, int(start_index)):])]
+        for option in normalized:
+            if option in {"LEFT", "CHANGELANELEFT"}:
+                return "Left Turn"
+            if option in {"RIGHT", "CHANGELANERIGHT"}:
+                return "Right Turn"
+        for option in normalized:
+            if option == "STRAIGHT":
+                return "Continue Straight"
         return "Continue Straight"
 
     def _failure_summary(

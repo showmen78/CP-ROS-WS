@@ -62,6 +62,7 @@ class ROSInputAdapter:
     ):
         """Store the planner components, prediction settings, and latest-message placeholders."""
         self.map_planner = map_planner
+        self.reference_map = map_planner
         self.route_manager = route_manager
         self.tracker = tracker
         self.lane_safety_scorer = lane_safety_scorer
@@ -164,11 +165,19 @@ class ROSInputAdapter:
             lane_ids = [current_lane_id]
 
         self._update_route(ego_pose=ego_pose, final_goal=snapshot.final_goal)
-        self.route_manager.sync_route_progress(
+        self.route_manager.sync_carla_route_progress(
             ego_x_m=float(ego_pose["x"]),
             ego_y_m=float(ego_pose["y"]),
             ego_heading_rad=float(ego_pose["heading_rad"]),
         )
+
+        cp_obstacles = self._native_opencda_messages(local_object_snapshots=snapshot.perception_objects, v2x_object_snapshots=snapshot.v2x_objects, ego_location=ego_pose, sim_time_s=float(snapshot.timestamp_s))
+        object_snapshots = self._fused_planning_object_snapshots(local_object_snapshots=snapshot.perception_objects, cp_obstacles=cp_obstacles, ego_location=ego_pose, sim_time_s=float(snapshot.timestamp_s))
+        lane_assignments = self._assign_obstacles_to_lanes(object_snapshots)
+        lane_safety_scores = self.lane_safety_scorer.compute_lane_scores(ego_snapshot=ego_snapshot, obstacle_snapshots=object_snapshots, lane_assignments=lane_assignments, ego_lane_id=int(current_lane_id), available_lane_ids=lane_ids, timestamp_s=float(snapshot.timestamp_s))
+        self.lane_safety_scorer.cleanup_stale_obstacles(set(lane_assignments.keys()))
+        front_dist_by_lane = self._nearest_front_distance_by_lane(ego_snapshot=ego_snapshot, obstacle_snapshots=object_snapshots, lane_assignments=lane_assignments, available_lane_ids=lane_ids)
+
         route_summary = self.route_manager.get_route_info(
             x_m=float(ego_pose["x"]),
             y_m=float(ego_pose["y"]),
@@ -202,22 +211,18 @@ class ROSInputAdapter:
         ]
         selected_control = self._select_relevant_traffic_control(
             traffic_controls=traffic_controls,
-            ego_pose=ego_pose,
+            ego_location=ego_pose,
+            ego_heading_rad=float(ego_pose["heading_rad"]),
             current_lane_id=current_lane_id,
             current_road_id=int(getattr(ego_waypoint, "road_id", 0) or 0),
             sim_time_s=float(snapshot.timestamp_s),
         )
-        signal_context, stop_target = self._traffic_context_from_control(selected_control=selected_control, ego_pose=ego_pose)
+        signal_context, stop_target = self._traffic_context_from_cp_control(selected_control=selected_control, ego_location=ego_pose)
         traffic_control_context = TrafficControlContext.from_signal_context(
             signal_context=signal_context,
             stop_target=stop_target,
         )
 
-        object_snapshots = self._fused_planning_object_snapshots(
-            local_object_snapshots=snapshot.perception_objects,
-            cp_obstacles=snapshot.v2x_objects,
-            sim_time_s=float(snapshot.timestamp_s),
-        )
         tracked_obstacles = self.tracker.update(
             obstacle_snapshots=object_snapshots,
             timestamp_s=float(snapshot.timestamp_s),
@@ -291,7 +296,7 @@ class ROSInputAdapter:
             perception=PerceptionContext(
                 dynamic_objects=[dict(item) for item in tracked_obstacles],
                 planning_objects=[dict(item) for item in tracked_obstacles],
-                source="ros_perception_and_v2x",
+                source="native_opencda",
             ),
             prediction=PredictionContext(
                 lane_assignments=dict(lane_assignments),
@@ -306,8 +311,7 @@ class ROSInputAdapter:
                 traffic_controls=[dict(item) for item in traffic_controls],
                 selected_traffic_control=selected_control,
                 lane_closures=[dict(item) for item in snapshot.lane_events],
-                obstacles=[dict(item) for item in snapshot.v2x_objects],
-                generated_traffic_light_control=selected_control,
+                obstacles=[dict(item) for item in cp_obstacles],
             ),
         )
 
@@ -333,7 +337,9 @@ class ROSInputAdapter:
             stop_target=stop_target,
             source_quality={
                 "planner_input_frame_timestamp_s": float(snapshot.timestamp_s),
-                "input_source": "ros",
+                "cp_message_timestamp_s": float(snapshot.timestamp_s),
+                "cp_message_age_s": 0.0,
+                "cp_message_valid": True,
                 **tracker_diagnostics,
             },
         )
@@ -360,8 +366,8 @@ class ROSInputAdapter:
             timestamp_s=self._stamp_seconds(self._localization.header.stamp),
             ego_pose=ego_pose,
             ego_speed_mps=ego_speed_mps,
-            perception_objects=self._tracked_objects(self._perception, source="ros_perception"),
-            v2x_objects=self._tracked_objects(self._v2x, source="ros_v2x"),
+            perception_objects=self._tracked_objects(self._perception, source="opencda_perception", provider_source="native_opencda_perception"),
+            v2x_objects=self._tracked_objects(self._v2x, source="opencda_v2x", provider_source="native_opencda_v2x"),
             traffic_lights=self._traffic_light_list(self._traffic_lights),
             lane_events=self._lane_event_list(self._cooperative),
             final_goal=final_goal,
@@ -380,7 +386,7 @@ class ROSInputAdapter:
         self.route_manager.set_destination(start_point=ego_pose, goal_point=final_goal)
         self._active_goal_signature = goal_signature
 
-    def _tracked_objects(self, message, *, source):
+    def _tracked_objects(self, message, *, source, provider_source):
         """Convert Autoware TrackedObjects into the object dictionaries expected by the current planner."""
         output = []
         for tracked in list(message.objects):
@@ -419,7 +425,7 @@ class ROSInputAdapter:
                     "height_m": float(dimensions.z),
                     "confidence": float(tracked.existence_probability),
                     "source": source,
-                    "provider_source": source,
+                    "provider_source": provider_source,
                 }
             )
         return output
@@ -471,11 +477,117 @@ class ROSInputAdapter:
             )
         return output
 
+    def _native_opencda_messages(self, *, local_object_snapshots, v2x_object_snapshots, ego_location, sim_time_s):
+        """Build the same CP obstacle list as OpenCDACPProvider._native_opencda_messages."""
+        messages = []
+        seen_actor_ids = set()
+
+        for index, snapshot in enumerate(list(local_object_snapshots or [])):
+            actor_id = self._object_actor_id(snapshot, fallback="perception:{}".format(index))
+            if actor_id in seen_actor_ids:
+                continue
+            message = self._object_to_cp_message(obj=snapshot, ego_location=ego_location, sim_time_s=float(sim_time_s), source="opencda_perception", provider_source="native_opencda_perception", fallback_id=actor_id)
+            if isinstance(message, Mapping):
+                seen_actor_ids.add(actor_id)
+                messages.append(dict(message))
+
+        for index, snapshot in enumerate(list(v2x_object_snapshots or [])):
+            actor_id = self._object_actor_id(snapshot, fallback="v2x:{}".format(index))
+            if actor_id in seen_actor_ids:
+                continue
+            message = self._object_to_cp_message(obj=snapshot, ego_location=ego_location, sim_time_s=float(sim_time_s), source="opencda_v2x", provider_source="native_opencda_v2x", fallback_id=actor_id)
+            if isinstance(message, Mapping):
+                seen_actor_ids.add(actor_id)
+                messages.append(dict(message))
+
+        return messages
+
+    def _object_to_cp_message(self, *, obj, ego_location, sim_time_s, source, provider_source, fallback_id):
+        """Copy OpenCDACPProvider._object_to_cp_message using primitive ROS object data and the custom map."""
+        try:
+            location = {"x": float(obj.get("x", 0.0)), "y": float(obj.get("y", 0.0)), "z": float(obj.get("z", 0.0))}
+            speed_mps = max(0.0, float(obj.get("v", 0.0)))
+            heading_rad = float(obj.get("psi", 0.0))
+            distance_m = math.hypot(float(location["x"]) - float(ego_location["x"]), float(location["y"]) - float(ego_location["y"]))
+        except Exception:
+            return None
+        if self.communication_range_m > 0.0 and distance_m > self.communication_range_m:
+            return None
+
+        lane_id = 0
+        road_id = -1
+        try:
+            waypoint = self._map_waypoint_from_location(map_planner=self.map_planner, location=location)
+            lane_id = int(canonical_lane_id_for_waypoint(waypoint))
+            road_id = int(getattr(waypoint, "road_id", -1) or -1)
+        except Exception:
+            pass
+
+        trajectory = self._constant_velocity_trajectory(x_m=float(location["x"]), y_m=float(location["y"]), speed_mps=float(speed_mps), heading_rad=float(heading_rad))
+        actor_id = self._object_actor_id(obj, fallback=fallback_id)
+        return {
+            "id": "{}:{}".format(provider_source, actor_id),
+            "type": "vehicle",
+            "source": str(source),
+            "provider_source": str(provider_source),
+            "timestamp_s": float(sim_time_s),
+            "ttl_s": max(0.2, 2.0 * float(self.mpc.dt_s)),
+            "confidence": 1.0,
+            "distance_m": float(distance_m),
+            "state": [float(location["x"]), float(location["y"]), float(speed_mps), float(heading_rad)],
+            "z": float(location["z"]),
+            "shape": {
+                "length_m": float(obj.get("length_m", 4.5)),
+                "width_m": float(obj.get("width_m", 2.0)),
+                "height_m": float(obj.get("height_m", 1.8)),
+            },
+            "road_id": int(road_id),
+            "lane_id": int(lane_id),
+            "trajectory": trajectory,
+        }
+
+    @staticmethod
+    def _object_actor_id(obj, fallback):
+        """Return the same stable actor identifier used by OpenCDACPProvider."""
+        if isinstance(obj, Mapping):
+            for key in ("id", "vehicle_id", "vid"):
+                value = obj.get(key)
+                if value is not None and str(value).strip():
+                    return str(value)
+        return str(fallback)
+
+    @staticmethod
+    def _map_waypoint_from_location(*, map_planner, location):
+        """Use the custom map at the same boundary where OpenCDA queries its map planner."""
+        if map_planner is None or location is None:
+            return None
+        get_waypoint = getattr(map_planner, "get_waypoint", None)
+        if not callable(get_waypoint):
+            return None
+        try:
+            return get_waypoint(location)
+        except Exception:
+            return None
+
+    def _constant_velocity_trajectory(self, *, x_m, y_m, speed_mps, heading_rad):
+        """Copy OpenCDACPProvider's constant-velocity CP trajectory calculation."""
+        prediction_horizon_s = float(self.mpc.horizon_s)
+        prediction_dt_s = float(self.mpc.dt_s)
+        steps = max(1, int(round(prediction_horizon_s / prediction_dt_s)))
+        cos_h = math.cos(float(heading_rad))
+        sin_h = math.sin(float(heading_rad))
+        trajectory = []
+        for index in range(steps + 1):
+            time_s = float(index) * prediction_dt_s
+            trajectory.append([float(x_m + speed_mps * cos_h * time_s), float(y_m + speed_mps * sin_h * time_s), float(speed_mps), float(heading_rad)])
+        return trajectory
+
     def _fused_planning_object_snapshots(
         self,
         *,
         local_object_snapshots: Sequence[Mapping[str, object]],
         cp_obstacles: Sequence[Mapping[str, object]],
+        ego_location: Mapping[str, object],
         sim_time_s: float,
     ) -> list[dict[str, object]]:
         """Fuse local perception and V2X objects using the same priority rules as OpenCDA."""
@@ -576,11 +688,10 @@ class ROSInputAdapter:
             if not raw_id:
                 return None
             state = obstacle.get("state", [])
-            state_values = (
-                list(state)
-                if isinstance(state, Sequence) and not isinstance(state, (str, bytes, bytearray))
-                else []
-            )
+            if isinstance(state, Sequence) and not isinstance(state, (str, bytes, bytearray)):
+                state_values = list(state)
+            else:
+                state_values = []
             x_m = obstacle.get("x", obstacle.get("x_m", state_values[0] if len(state_values) >= 1 else None))
             y_m = obstacle.get("y", obstacle.get("y_m", state_values[1] if len(state_values) >= 2 else None))
             speed_mps = obstacle.get(
@@ -597,6 +708,8 @@ class ROSInputAdapter:
             shape = obstacle.get("shape", {})
             shape = dict(shape) if isinstance(shape, Mapping) else {}
             obstacle_id = raw_id.rsplit(":", 1)[-1] if ":" in raw_id else raw_id
+            provider_source = str(obstacle.get("provider_source", "opencda_cp"))
+            source = str(obstacle.get("source", "opencda_cp"))
             return {
                 "vehicle_id": obstacle_id,
                 "id": obstacle_id,
@@ -607,8 +720,8 @@ class ROSInputAdapter:
                 "psi": float(heading_rad),
                 "length_m": float(shape.get("length_m", obstacle.get("length_m", 4.5))),
                 "width_m": float(shape.get("width_m", obstacle.get("width_m", 2.0))),
-                "source": str(obstacle.get("source", "opencda_cp")),
-                "provider_source": str(obstacle.get("provider_source", "opencda_cp")),
+                "source": source,
+                "provider_source": provider_source,
                 "confidence": float(obstacle.get("confidence", 0.5)),
                 "lane_id": int(float(obstacle.get("lane_id", 0) or 0)),
                 "road_id": int(float(obstacle.get("road_id", 0) or 0)),
@@ -686,7 +799,7 @@ class ROSInputAdapter:
             if not obstacle_id:
                 continue
 
-            waypoint = self.map_planner.get_waypoint(
+            waypoint = self.reference_map.get_waypoint(
                 {
                     "x": float(snapshot.get("x", 0.0)),
                     "y": float(snapshot.get("y", 0.0)),
@@ -702,14 +815,17 @@ class ROSInputAdapter:
     @staticmethod
     def _object_track_id(snapshot: Mapping[str, object]) -> str:
         """Return the same stable object key that OpenCDA uses for tracking and lane assignment."""
-        for key in ("track_id", "vehicle_id", "id", "actor_id"):
+        for key in ("track_id", "object_id", "vehicle_id", "actor_id", "id"):
             value = snapshot.get(key)
             if value is not None and str(value).strip():
                 return str(value).strip()
-        return ""
+        try:
+            return "xy:{:.1f}:{:.1f}".format(float(snapshot.get("x", snapshot.get("x_m", 0.0))), float(snapshot.get("y", snapshot.get("y_m", 0.0))))
+        except Exception:
+            return ""
 
+    @staticmethod
     def _nearest_front_distance_by_lane(
-        self,
         *,
         ego_snapshot: Mapping[str, object],
         obstacle_snapshots: Sequence[Mapping[str, object]],
@@ -796,19 +912,19 @@ class ROSInputAdapter:
             "source": "native_opencda",
             "provider_source": "native_opencda_traffic_light",
             "signal_actor_id": control_id,
-            "signal_actor_name": str(traffic_light.get("type", "")),
-            "signal_actor_raw_state": str(traffic_light.get("state", "unknown")),
+            "signal_actor_name": "traffic.traffic_light" if str(traffic_light.get("type", "")).strip().lower() == "traffic_light" else str(traffic_light.get("type", "")),
+            "signal_actor_raw_state": str(traffic_light.get("state", "unknown")).strip().capitalize(),
             "signal_distance_m": distance_m,
             "signal_forward_m": forward_m,
             "signal_lateral_m": lateral_m,
         }
 
-    def _select_relevant_traffic_control(self, *, traffic_controls, ego_pose, current_lane_id, current_road_id, sim_time_s):
+    def _select_relevant_traffic_control(self, *, traffic_controls, ego_location, ego_heading_rad, current_lane_id, current_road_id, sim_time_s):
         """Select the relevant unpassed traffic light with the same scoring order used by OpenCDA."""
         best_control = None
         best_score = None
-        cos_h = math.cos(float(ego_pose["heading_rad"]))
-        sin_h = math.sin(float(ego_pose["heading_rad"]))
+        cos_h = math.cos(float(ego_heading_rad))
+        sin_h = math.sin(float(ego_heading_rad))
         for control in list(traffic_controls or []):
             if not isinstance(control, Mapping) or not self._cp_message_is_fresh(control, sim_time_s=float(sim_time_s)):
                 continue
@@ -819,16 +935,16 @@ class ROSInputAdapter:
             y_value = stop_line.get("y", stop_line.get("y_m"))
             if x_value is None or y_value is None:
                 continue
-            dx_m = float(x_value) - float(ego_pose["x"])
-            dy_m = float(y_value) - float(ego_pose["y"])
+            dx_m = float(x_value) - float(ego_location["x"])
+            dy_m = float(y_value) - float(ego_location["y"])
             forward_m = cos_h * dx_m + sin_h * dy_m
             lateral_m = -sin_h * dx_m + cos_h * dy_m
             if bool(control.get("ego_passed_stop_line", False)) or forward_m < -1.0:
                 continue
-            stop_lane_id = int(float(control.get("lane_id", stop_line.get("lane_id", 0)) or 0))
-            stop_road_id = int(float(control.get("road_id", stop_line.get("road_id", 0)) or 0))
-            road_mismatch = 1.0 if stop_road_id and current_road_id and stop_road_id != current_road_id else 0.0
-            lane_mismatch = 1.0 if stop_lane_id and current_lane_id and stop_lane_id != current_lane_id else 0.0
+            lane_id = int(float(control.get("lane_id", stop_line.get("lane_id", 0)) or 0))
+            road_id = int(float(control.get("road_id", stop_line.get("road_id", 0)) or 0))
+            road_mismatch = 1.0 if road_id and current_road_id and road_id != current_road_id else 0.0
+            lane_mismatch = 1.0 if lane_id and current_lane_id and lane_id != current_lane_id else 0.0
             score = (road_mismatch, lane_mismatch, abs(lateral_m) + 0.01 * forward_m)
             if best_score is None or score < best_score:
                 best_control = control
@@ -836,7 +952,7 @@ class ROSInputAdapter:
         return best_control
 
     @staticmethod
-    def _traffic_context_from_control(*, selected_control, ego_pose):
+    def _traffic_context_from_cp_control(*, selected_control, ego_location):
         """Convert the selected internal control into the same signal context and stop target used by OpenCDA."""
         if not isinstance(selected_control, Mapping):
             return {"signal_state": "unknown", "from_cp": False}, None
@@ -852,7 +968,7 @@ class ROSInputAdapter:
                     "y_m": float(y_value),
                     "lane_id": int(float(selected_control.get("lane_id", stop_line.get("lane_id", 0)) or 0)),
                     "road_id": int(float(selected_control.get("road_id", stop_line.get("road_id", 0)) or 0)),
-                    "distance_m": math.hypot(float(x_value) - float(ego_pose["x"]), float(y_value) - float(ego_pose["y"])),
+                    "distance_m": math.hypot(float(x_value) - float(ego_location["x"]), float(y_value) - float(ego_location["y"])),
                     "source": "opencda_cp_control",
                 }
         context = {

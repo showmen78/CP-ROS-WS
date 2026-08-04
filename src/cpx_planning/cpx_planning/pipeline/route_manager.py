@@ -51,15 +51,15 @@ class CPXRouteManager:
 
         # A route node keeps both coordinates and custom-map information. The coordinates guide the MPC,
         # while the waypoint and route option tell the behavior planner which lane and maneuver apply there.
-        self._route_nodes_cache: List[Tuple[float, float, float, Any, str]] = []
-        self._route_progress_index = 0
-        self._route_progress_initialized = False
+        self._carla_route_entries: List[Tuple[float, float, float, Any, str]] = []
+        self._carla_route_progress_index = 0
+        self._carla_route_progress_initialized = False
 
         # This value describes the closest place on the route: segment number, projected x and y,
         # position within that segment, and sideways distance from the route.
-        self._route_projection: Optional[Tuple[int, float, float, float, float]] = None
-        self._route_sync_reason = "route_progress_not_initialized"
-        self._route_debug_reason = "route_not_initialized"
+        self._carla_route_projection: Optional[Tuple[int, float, float, float, float]] = None
+        self._carla_route_sync_reason = "route_progress_not_initialized"
+        self._carla_route_debug_reason = "route_not_initialized"
         self._last_status = RouteManagerStatus(debug_reason="route_not_initialized")
 
     def set_destination(self, *, start_point: Mapping[str, object], goal_point: Mapping[str, object]) -> Any:
@@ -78,7 +78,7 @@ class CPXRouteManager:
         )
 
         self._active_route_summary = summary
-        self._build_route_nodes(summary)
+        self._build_carla_route(start_point=self._start_point, goal_point=self._goal_point)
         self._fallback_route_points = []
 
         route_found = bool(getattr(summary, "route_found", False))
@@ -188,7 +188,7 @@ class CPXRouteManager:
 
         return [list(point) for point in self._fallback_route_points]
 
-    def route_reference(
+    def carla_waypoint_reference(
         self,
         *,
         ego_x_m: float,
@@ -201,16 +201,16 @@ class CPXRouteManager:
     ) -> Tuple[List[Dict[str, object]], str]:
         """Build the short route reference that the MPC follows."""
 
-        sync_reason = self.sync_route_progress(
+        sync_reason = self.sync_carla_route_progress(
             ego_x_m=float(ego_x_m), ego_y_m=float(ego_y_m), ego_heading_rad=float(ego_heading_rad)
         )
-        nodes = self._route_nodes()
+        nodes = self._carla_route_nodes()
         if len(nodes) < 2:
             return [], str(sync_reason or "route_waypoints_empty")
-        if self._route_projection is None:
+        if self._carla_route_projection is None:
             return [], str(sync_reason or "route_projection_failed")
 
-        segment_index, projection_x_m, projection_y_m, projection_ratio, lateral_distance_m = self._route_projection
+        segment_index, projection_x_m, projection_y_m, projection_ratio, lateral_distance_m = self._carla_route_projection
         if float(lateral_distance_m) > float(self.stale_route_lateral_m):
             # Reference points from a route far away from the ego could make the MPC steer toward the wrong road.
             return [], str(sync_reason)
@@ -224,7 +224,7 @@ class CPXRouteManager:
             (float(projection_x_m), float(projection_y_m), float(projection_z_m), second[3], second[4])
         ]
         polyline.extend(nodes[segment_index + 1:])
-        polyline = _deduplicate_route_nodes(polyline)
+        polyline = _deduplicate_carla_nodes(polyline)
         if len(polyline) < 2:
             return [], "route_remaining_polyline_too_short"
 
@@ -300,7 +300,7 @@ class CPXRouteManager:
 
         return samples, "custom_global_route"
 
-    def sync_route_progress(
+    def sync_carla_route_progress(
         self,
         *,
         ego_x_m: float,
@@ -309,13 +309,13 @@ class CPXRouteManager:
     ) -> str:
         """Find where the ego vehicle is on the active custom route."""
 
-        nodes = self._route_nodes()
+        nodes = self._carla_route_nodes()
         if len(nodes) < 2:
-            self._route_projection = None
-            self._route_sync_reason = str(self._route_debug_reason or "route_unavailable")
-            return self._route_sync_reason
+            self._carla_route_projection = None
+            self._carla_route_sync_reason = str(self._carla_route_debug_reason or "route_unavailable")
+            return self._carla_route_sync_reason
 
-        if not self._route_progress_initialized:
+        if not self._carla_route_progress_initialized:
             # On the first update, search the whole route because the ego's starting segment is not known yet.
             lower_index = 0
             upper_index = len(nodes) - 1
@@ -323,11 +323,11 @@ class CPXRouteManager:
         else:
             # After initialization, search near the last segment. This is faster and avoids jumping to a
             # different piece of road when the route crosses or runs close to itself.
-            lower_index = max(0, int(self._route_progress_index) - 5)
-            upper_index = min(len(nodes) - 1, max(lower_index + 1, int(self._route_progress_index) + 80))
+            lower_index = max(0, int(self._carla_route_progress_index) - 5)
+            upper_index = min(len(nodes) - 1, max(lower_index + 1, int(self._carla_route_progress_index) + 80))
             search_mode = "local_update"
 
-        best_projection = _best_route_projection(
+        best_projection = _best_carla_route_projection(
             nodes=nodes,
             ego_x_m=float(ego_x_m),
             ego_y_m=float(ego_y_m),
@@ -337,17 +337,17 @@ class CPXRouteManager:
         )
 
         if best_projection is None:
-            self._route_sync_reason = f"route_progress_{search_mode}_failed"
-            return self._route_sync_reason
+            self._carla_route_sync_reason = f"route_progress_{search_mode}_failed"
+            return self._carla_route_sync_reason
 
         _, _, best_index, _, _, _ = best_projection
 
         # Route progress is not allowed to move backward. This prevents noisy ego positions from making the
         # planner return reference points that the vehicle has already passed.
-        if not self._route_progress_initialized:
+        if not self._carla_route_progress_initialized:
             segment_index = int(best_index)
         else:
-            segment_index = max(int(self._route_progress_index), int(best_index))
+            segment_index = max(int(self._carla_route_progress_index), int(best_index))
 
         first = nodes[segment_index]
         second = nodes[min(segment_index + 1, len(nodes) - 1)]
@@ -355,9 +355,9 @@ class CPXRouteManager:
             x_m=float(ego_x_m), y_m=float(ego_y_m), first_xy=(first[0], first[1]), second_xy=(second[0], second[1])
         )
 
-        self._route_progress_index = int(segment_index)
-        self._route_progress_initialized = True
-        self._route_projection = (
+        self._carla_route_progress_index = int(segment_index)
+        self._carla_route_progress_initialized = True
+        self._carla_route_projection = (
             int(segment_index),
             float(projection_x_m),
             float(projection_y_m),
@@ -366,26 +366,26 @@ class CPXRouteManager:
         )
 
         if float(lateral_distance_m) > float(self.stale_route_lateral_m):
-            self._route_sync_reason = f"route_stale:lateral={float(lateral_distance_m):.2f}"
+            self._carla_route_sync_reason = f"route_stale:lateral={float(lateral_distance_m):.2f}"
         else:
-            self._route_sync_reason = f"route_progress_{search_mode}:index={segment_index}"
+            self._carla_route_sync_reason = f"route_progress_{search_mode}:index={segment_index}"
 
-        return self._route_sync_reason
+        return self._carla_route_sync_reason
 
     @property
-    def route_debug_reason(self) -> str:
+    def carla_route_debug_reason(self) -> str:
         """Return the latest message about route creation and route-node preparation."""
-        return str(self._route_debug_reason)
+        return str(self._carla_route_debug_reason)
 
     @property
-    def route_sync_reason(self) -> str:
+    def carla_route_sync_reason(self) -> str:
         """Return the latest message about matching the ego vehicle to the route."""
-        return str(self._route_sync_reason)
+        return str(self._carla_route_sync_reason)
 
     @property
-    def route_progress_index(self) -> int:
+    def carla_route_progress_index(self) -> int:
         """Return the route segment number that the ego vehicle has reached."""
-        return int(self._route_progress_index)
+        return int(self._carla_route_progress_index)
 
     @property
     def last_status(self) -> RouteManagerStatus:
@@ -406,24 +406,26 @@ class CPXRouteManager:
 
         self._active_route_summary = summary
         self._fallback_route_points = []
-        self._build_route_nodes(summary)
+        self._build_carla_route(start_point=self._start_point or {}, goal_point=self._goal_point or {})
         self._last_status = self._status_from_summary(summary)
         return True
 
-    def _route_nodes(self) -> List[Tuple[float, float, float, Any, str]]:
+    def _carla_route_nodes(self) -> List[Tuple[float, float, float, Any, str]]:
         """Return a copy of the saved route nodes so callers cannot replace the internal list."""
-        return list(self._route_nodes_cache)
+        return list(self._carla_route_entries)
 
-    def _build_route_nodes(self, summary: Any) -> None:
+    def _build_carla_route(self, *, start_point: Mapping[str, object], goal_point: Mapping[str, object]) -> None:
         """Convert a custom route summary into the route nodes used for progress and MPC reference generation."""
-        self._route_nodes_cache = []
-        self._route_progress_index = 0
-        self._route_progress_initialized = False
-        self._route_projection = None
-        self._route_sync_reason = "route_progress_not_initialized"
+        del start_point, goal_point
+        summary = self._active_route_summary
+        self._carla_route_entries = []
+        self._carla_route_progress_index = 0
+        self._carla_route_progress_initialized = False
+        self._carla_route_projection = None
+        self._carla_route_sync_reason = "route_progress_not_initialized"
 
         if not bool(getattr(summary, "route_found", False)):
-            self._route_debug_reason = "custom_global_route_not_found"
+            self._carla_route_debug_reason = "custom_global_route_not_found"
             return
 
         route_waypoints = list(getattr(summary, "route_waypoints", []) or [])
@@ -455,18 +457,18 @@ class CPXRouteManager:
             # Repeated points create zero-length segments, which would make route projection and interpolation
             # unreliable, so adjacent duplicates are ignored.
             if (
-                self._route_nodes_cache
-                and math.hypot(node[0] - self._route_nodes_cache[-1][0], node[1] - self._route_nodes_cache[-1][1])
+                self._carla_route_entries
+                and math.hypot(node[0] - self._carla_route_entries[-1][0], node[1] - self._carla_route_entries[-1][1])
                 < 1.0e-3
             ):
                 continue
 
-            self._route_nodes_cache.append(node)
+            self._carla_route_entries.append(node)
 
-        if len(self._route_nodes_cache) >= 2:
-            self._route_debug_reason = "custom_global_route_ready"
+        if len(self._carla_route_entries) >= 2:
+            self._carla_route_debug_reason = "custom_global_route_ready"
         else:
-            self._route_debug_reason = "custom_global_route_too_short"
+            self._carla_route_debug_reason = "custom_global_route_too_short"
 
     def _status_from_summary(self, summary: Any) -> RouteManagerStatus:
         """Create the small route status used by the rest of the planning pipeline."""
@@ -632,7 +634,7 @@ def _project_to_segment(
     return float(projected_x_m), float(projected_y_m), float(ratio), float(lateral_distance_m)
 
 
-def _best_route_projection(
+def _best_carla_route_projection(
     *,
     nodes: Sequence[Tuple[float, float, float, Any, str]],
     ego_x_m: float,
@@ -677,7 +679,7 @@ def _best_route_projection(
     return best
 
 
-def _deduplicate_route_nodes(
+def _deduplicate_carla_nodes(
     nodes: Sequence[Tuple[float, float, float, Any, str]]
 ) -> List[Tuple[float, float, float, Any, str]]:
     """Remove adjacent route nodes that have the same position."""

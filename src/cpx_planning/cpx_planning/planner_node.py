@@ -174,7 +174,7 @@ class CPXPlannerNode(Node):
             "full_low_speed_launch_stuck_s": 0.8,
             "full_low_speed_launch_stuck_distance_m": 0.15,
             "full_lane_follow_max_destination_lateral_m": 1.2,
-            "full_lane_follow_max_reference_first_lateral_m": 0.65,
+            "full_lane_follow_max_reference_first_lateral_m":1, #0.65
             "full_stop_max_destination_lateral_m": 1.0,
             "full_stop_max_reference_first_lateral_m": 0.55,
             "full_mpc_reference_stabilizer_enabled": True,
@@ -295,7 +295,7 @@ class CPXPlannerNode(Node):
         })
 
         self.behavior_planner = RuleBasedBehaviorPlanner(cp_message_path=None, cooperative_message_check_frequency_hz=float(self.get_parameter("cooperative_message_check_frequency_hz").value))
-        self.planning_pipeline = CPXMPCPlannerBridge(
+        self.planner_bridge = CPXMPCPlannerBridge(
             behavior_planner=self.behavior_planner,
             route_manager=self.route_manager,
             global_planner=self.global_planner,
@@ -305,6 +305,7 @@ class CPXPlannerNode(Node):
             behavior_runtime_cfg=self.behavior_runtime_cfg,
             config=behavior_config,
         )
+        self.planning_pipeline = self.planner_bridge.planning_pipeline
         
         
         control_topic = str(self.get_parameter("control_topic").value)
@@ -469,7 +470,7 @@ class CPXPlannerNode(Node):
         self.write_planner_input_adapter_output(adapter_output)
         
         try:
-            planner_output = self.planning_pipeline._run_full_cpx_pipeline_step(adapter_output)
+            planner_output = self.planner_bridge.run_step(adapter_output)
         except Exception as error:
             self.get_logger().error("Could not run the planning cycle: {}".format(error))
             return
@@ -484,7 +485,7 @@ class CPXPlannerNode(Node):
         
         
         behavior_command = planner_output.behavior_command.as_dict()
-        destination_state = list(self.planning_pipeline.last_destination_state or [])
+        destination_state = list(self.planner_bridge.last_destination_state or [])
         lane_center_reference = [dict(sample) for sample in planner_output.reference_trajectory]
         reference_debug = planner_output.diagnostics.as_dict()
 
