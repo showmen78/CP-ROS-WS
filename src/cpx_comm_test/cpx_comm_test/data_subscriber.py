@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
-"""Subscribe to and print all OpenCDA data published through ROS 2."""
+"""Subscribe to ROS data, print it, and forward planner output to OpenCDA."""
 
+from autoware_control_msgs.msg import Control
 from autoware_perception_msgs.msg import TrackedObjects
 from cpx_interfaces.msg import CooperativeMessageArray
 from cpx_interfaces.msg import TrafficLightObservationArray
@@ -28,11 +29,12 @@ TOPICS = {
         "/cpx/cooperative_messages",
     ),
     "planner_shadow_output": (String, "/cpx/planner_shadow_output"),
+    "planner_control": (Control, "/control/command/control_cmd"),
 }
 
 
 class DataSubscriber(Node):
-    """Print every OpenCDA data stream published through ROS."""
+    """Print ROS data and send planner results back to OpenCDA over TCP."""
 
     def __init__(self):
         super().__init__("opencda_data_subscriber")
@@ -55,13 +57,15 @@ class DataSubscriber(Node):
                 10,
             )
 
-        self.get_logger().info("Listening to all five OpenCDA topics.")
+        self.get_logger().info("Listening to OpenCDA input topics and ROS planner output topics.")
 
     def print_message(self, data_type, message):
         """Print one typed ROS message and send a JSON copy to OpenCDA."""
         # ROS already formats typed messages in a readable field-by-field form.
         if data_type == "planner_shadow_output":
             self.get_logger().info("ROS planner shadow output received.")
+        elif data_type == "planner_control":
+            self.get_logger().info("ROS planner control received: acceleration={:.3f} m/s^2, steering={:.3f} rad.".format(message.longitudinal.acceleration, message.lateral.steering_tire_angle))
         else:
             self.get_logger().info("{} data:\n{}".format(data_type, message))
 
@@ -70,14 +74,21 @@ class DataSubscriber(Node):
         forwarded_data = {
             "schema_version": 1,
             "sequence": self.sequence,
-            "timestamp_s": (
-                self.get_clock().now().nanoseconds / 1000000000.0
-            ),
+            "timestamp_s": self.get_clock().now().nanoseconds / 1000000000.0,
             "message_type": data_type,
             "data": ros_message_to_dict(message),
         }
-        
-        if data_type== "planner_shadow_output":
+
+        # Send a small, direct control payload so OpenCDA can later convert it to carla.VehicleControl.
+        if data_type == "planner_control":
+            forwarded_data["data"] = {
+                "target_speed_mps": float(message.longitudinal.velocity),
+                "acceleration_mps2": float(message.longitudinal.acceleration),
+                "steering_rad": float(message.lateral.steering_tire_angle),
+            }
+
+        # Keep the comparison stream and the real control stream available at the same time.
+        if data_type in {"planner_shadow_output", "planner_control"}:
             self.sender.send(forwarded_data)
 
     def destroy_node(self):

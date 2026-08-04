@@ -507,10 +507,11 @@ def get_opendrive_lane_info(ad_lane_id: int) -> dict[str, int | None]:
     road_id = ad_lane_id // 10000
     lane_section_index = ad_lane_id % 10000 // 100
     lane_id = ad_lane_id % 100 - 50
+    # AD-map encodes lane sections from one, while OpenDRIVE/CARLA expose them from zero.
     return {
         "ad_lane_id": ad_lane_id,
         "road_id": road_id,
         "lane_section_index": lane_section_index,
-        "section_id": lane_section_index,
+        "section_id": lane_section_index - 1,
         "lane_id": lane_id,
     }

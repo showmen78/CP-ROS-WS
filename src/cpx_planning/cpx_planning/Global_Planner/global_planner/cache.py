@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def compute_xodr_signature(xodr_path: Path) -> Dict[str, Any]:

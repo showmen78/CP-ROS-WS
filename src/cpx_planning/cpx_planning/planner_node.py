@@ -174,7 +174,7 @@ class CPXPlannerNode(Node):
             "full_low_speed_launch_stuck_s": 0.8,
             "full_low_speed_launch_stuck_distance_m": 0.15,
             "full_lane_follow_max_destination_lateral_m": 1.2,
-            "full_lane_follow_max_reference_first_lateral_m":1, #0.65
+            "full_lane_follow_max_reference_first_lateral_m":0.65, #0.65
             "full_stop_max_destination_lateral_m": 1.0,
             "full_stop_max_reference_first_lateral_m": 0.55,
             "full_mpc_reference_stabilizer_enabled": True,

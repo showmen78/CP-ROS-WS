@@ -407,7 +407,11 @@ class GlobalPlanner:
         lane_data = self._lane_cache.get(waypoint.ad_lane_id)
         if lane_data is None:
             return None
-        key = "left_lane_id" if side == "left" else "right_lane_id"
+        # AD-map stores left and right in map direction, so reverse them when legal travel follows the opposite direction.
+        map_side = side
+        if not bool(lane_data.get("direction_positive", True)):
+            map_side = "right" if side == "left" else "left"
+        key = "left_lane_id" if map_side == "left" else "right_lane_id"
         adjacent_lane_id = lane_data.get(key)
         if adjacent_lane_id is None:
             return None
