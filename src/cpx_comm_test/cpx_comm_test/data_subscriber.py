@@ -28,7 +28,7 @@ TOPICS = {
         CooperativeMessageArray,
         "/cpx/cooperative_messages",
     ),
-    "planner_shadow_output": (String, "/cpx/planner_shadow_output"),
+    "debug_output": (String, "/cpx/debug_output"),
     "planner_control": (Control, "/control/command/control_cmd"),
 }
 
@@ -62,8 +62,8 @@ class DataSubscriber(Node):
     def print_message(self, data_type, message):
         """Print one typed ROS message and send a JSON copy to OpenCDA."""
         # ROS already formats typed messages in a readable field-by-field form.
-        if data_type == "planner_shadow_output":
-            self.get_logger().info("ROS planner shadow output received.")
+        if data_type == "debug_output":
+            self.get_logger().info("ROS planner debug output received.")
         elif data_type == "planner_control":
             self.get_logger().info("ROS planner control received: acceleration={:.3f} m/s^2, steering={:.3f} rad.".format(message.longitudinal.acceleration, message.lateral.steering_tire_angle))
         else:
@@ -88,7 +88,7 @@ class DataSubscriber(Node):
             }
 
         # Keep the comparison stream and the real control stream available at the same time.
-        if data_type in {"planner_shadow_output", "planner_control"}:
+        if data_type in {"debug_output", "planner_control"}:
             self.sender.send(forwarded_data)
 
     def destroy_node(self):

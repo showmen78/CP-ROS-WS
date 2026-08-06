@@ -174,7 +174,7 @@ class CPXPlannerNode(Node):
             "full_low_speed_launch_stuck_s": 0.8,
             "full_low_speed_launch_stuck_distance_m": 0.15,
             "full_lane_follow_max_destination_lateral_m": 1.2,
-            "full_lane_follow_max_reference_first_lateral_m":0.65, #0.65
+            "full_lane_follow_max_reference_first_lateral_m":5.0, #0.65
             "full_stop_max_destination_lateral_m": 1.0,
             "full_stop_max_reference_first_lateral_m": 0.55,
             "full_mpc_reference_stabilizer_enabled": True,
@@ -311,7 +311,7 @@ class CPXPlannerNode(Node):
         control_topic = str(self.get_parameter("control_topic").value)
         self.ros_output_adapter = ROSOutputAdapter()
         self.control_publisher = self.create_publisher(Control, control_topic, 10)
-        self.shadow_output_publisher = self.create_publisher(String, "/cpx/planner_shadow_output", 10)
+        self.debug_output_publisher = self.create_publisher(String, "/cpx/debug_output", 10)
 
         self.localization_subscription = self.create_subscription(
             Odometry, "/cpx/localization", self.input_adapter.update_localization, 10
@@ -353,7 +353,7 @@ class CPXPlannerNode(Node):
         self.get_logger().info("CP-X planner node is waiting for ROS inputs.")
         
         
-    def publish_shadow_output(self, adapter_output, planner_output):
+    def publish_debug_output(self, adapter_output, planner_output):
         """Send the ROS planner input summary and output back for comparison."""
         frame = adapter_output.frame
         diagnostics = planner_output.diagnostics.as_dict()
@@ -431,7 +431,7 @@ class CPXPlannerNode(Node):
 
         message = String()
         message.data = json.dumps(payload, allow_nan=False, separators=(",", ":"))
-        self.shadow_output_publisher.publish(message)
+        self.debug_output_publisher.publish(message)
 
     def write_planner_input_adapter_output(self, adapter_output):
         """Append every field of one ROS PlannerInputAdapterOutput without changing the planning cycle."""
@@ -476,7 +476,7 @@ class CPXPlannerNode(Node):
             return
         
         self.latest_planner_output = planner_output
-        self.publish_shadow_output(adapter_output, planner_output)
+        self.publish_debug_output(adapter_output, planner_output)
         control_message = self.ros_output_adapter.build_control_message(planner_output=planner_output, stamp=self.get_clock().now().to_msg())
         self.control_publisher.publish(control_message)
         self.latest_control_message = control_message
