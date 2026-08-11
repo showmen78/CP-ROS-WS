@@ -34,6 +34,7 @@ setup(
             "traffic_light_publisher = cpx_comm_test.traffic_light_publisher:main",
             "v2x_publisher = cpx_comm_test.v2x_publisher:main",
             "cooperative_message_publisher = cpx_comm_test.cooperative_message_publisher:main",
+            "safety_status_publisher = cpx_comm_test.safety_status_publisher:main",
             "data_subscriber = cpx_comm_test.data_subscriber:main",
         ],
     },

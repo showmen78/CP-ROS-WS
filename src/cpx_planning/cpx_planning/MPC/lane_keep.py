@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Dict, Mapping, Sequence, Tuple
+from typing import Dict, List, Mapping, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -187,6 +187,34 @@ def signed_lateral_offset_affine_form(
     )
 
 
+def signed_longitudinal_progress_affine_form(
+    reference: LaneKeepingStageReference,
+) -> LaneKeepingAffineForm:
+    """Return the affine form of the signed along-track (longitudinal)
+    offset from the reference point, in the lane frame -- the component
+    perpendicular to signed_lateral_offset_affine_form's lateral offset.
+
+    Used to decompose a raw world-(x,y) attraction term into lane-local
+    longitudinal/lateral components instead of pulling x and y toward
+    (x_center_m, y_center_m) independently, which couples world-frame x/y
+    errors together and doesn't rotate with lane heading the way the
+    lateral-offset term already does.
+    """
+
+    lane_heading_rad = float(reference.heading_rad)
+    sin_heading = math.sin(lane_heading_rad)
+    cos_heading = math.cos(lane_heading_rad)
+    return LaneKeepingAffineForm(
+        x_coef=cos_heading,
+        y_coef=sin_heading,
+        constant=-(
+            cos_heading * float(reference.x_center_m)
+            + sin_heading * float(reference.y_center_m)
+        ),
+        reference=reference,
+    )
+
+
 def signed_lateral_offset(
     x_m: float,
     y_m: float,
@@ -354,3 +382,167 @@ def evaluate_lane_keeping_profile(
         stage_metrics=tuple(stage_metrics),
         total_cost=float(total_cost),
     )
+
+
+@dataclass(frozen=True)
+class RoadEnvelopeBlock:
+    """A static hyperellipse "safe block" (Yu et al., arXiv:2509.18506, Eq 36-38).
+
+    Used as a lane-change-local drivable-corridor primitive that stays fixed
+    once built, unlike a single reference line that can jump when the
+    tracked reference source switches lanes mid-maneuver.
+    """
+
+    x_center_m: float
+    y_center_m: float
+    heading_rad: float
+    half_length_m: float
+    half_width_m: float
+    shape_exponent: float = 4.0
+
+    def __post_init__(self) -> None:
+        if float(self.shape_exponent) < 2.0 or int(round(float(self.shape_exponent))) % 2 != 0:
+            raise ValueError("RoadEnvelopeBlock.shape_exponent must be an even integer >= 2.")
+
+
+def road_envelope_block_signed_distance(
+    block: RoadEnvelopeBlock,
+    x_m: float,
+    y_m: float,
+) -> Tuple[float, float, float]:
+    """Signed hyperellipse distance g_b = d_b - 1 and its exact gradient.
+
+    g_b <= 0 means (x_m, y_m) is inside the block. shape_exponent is
+    required even (see RoadEnvelopeBlock.__post_init__), so |t|^p == t^p
+    everywhere -- no abs()-kink, fully smooth except at the block's own
+    center (deep interior, never relevant to a boundary constraint).
+    """
+
+    p = float(block.shape_exponent)
+    half_length_m = max(1.0e-6, float(block.half_length_m))
+    half_width_m = max(1.0e-6, float(block.half_width_m))
+    cos_h = math.cos(float(block.heading_rad))
+    sin_h = math.sin(float(block.heading_rad))
+    dx = float(x_m) - float(block.x_center_m)
+    dy = float(y_m) - float(block.y_center_m)
+    along = cos_h * dx + sin_h * dy
+    across = cos_h * dy - sin_h * dx
+
+    along_term = (along / half_length_m) ** p
+    across_term = (across / half_width_m) ** p
+    s_value = float(along_term + across_term)
+    s_value_safe = max(s_value, 1.0e-12)
+
+    d_along_term_dalong = p * (along / half_length_m) ** (p - 1.0) / half_length_m
+    d_across_term_dacross = p * (across / half_width_m) ** (p - 1.0) / half_width_m
+    ds_dx = d_along_term_dalong * cos_h - d_across_term_dacross * sin_h
+    ds_dy = d_along_term_dalong * sin_h + d_across_term_dacross * cos_h
+
+    d_value = s_value_safe ** (1.0 / p)
+    dd_ds = (1.0 / p) * s_value_safe ** (1.0 / p - 1.0)
+    g_b = float(d_value - 1.0)
+    dg_dx = float(dd_ds * ds_dx)
+    dg_dy = float(dd_ds * ds_dy)
+    return g_b, dg_dx, dg_dy
+
+
+def road_envelope_union_logsumexp(
+    blocks: Sequence[RoadEnvelopeBlock],
+    rho: float,
+    x_m: float,
+    y_m: float,
+) -> Tuple[float, float, float, Tuple[float, ...]]:
+    """Smooth OR (union) of block memberships via negative-rho LogSumExp.
+
+    (Yu et al., Lemma 4, Eq 48.) Bounds: g_min + ln(n)/rho <= g_lse <= g_min
+    for rho < 0. The gradient of a LogSumExp is exactly the softmax-weighted
+    blend of the constituent gradients -- closed form, no finite differences.
+    """
+
+    rho_value = float(rho)
+    if rho_value >= 0.0:
+        raise ValueError("road_envelope_union_logsumexp requires rho < 0.")
+    if not blocks:
+        raise ValueError("road_envelope_union_logsumexp requires at least one block.")
+
+    per_block = [
+        road_envelope_block_signed_distance(block, float(x_m), float(y_m))
+        for block in blocks
+    ]
+    g_values = [float(item[0]) for item in per_block]
+    z_values = [rho_value * g for g in g_values]
+
+    z_max = max(z_values)
+    exp_shifted = [math.exp(z - z_max) for z in z_values]
+    exp_sum = sum(exp_shifted)
+    g_lse = float((z_max + math.log(exp_sum)) / rho_value)
+
+    weights = tuple(float(value / exp_sum) for value in exp_shifted)
+    dg_dx = sum(w * item[1] for w, item in zip(weights, per_block))
+    dg_dy = sum(w * item[2] for w, item in zip(weights, per_block))
+    return g_lse, float(dg_dx), float(dg_dy), weights
+
+
+def road_envelope_block_boundary_probe_points_xy(
+    block: RoadEnvelopeBlock,
+    *,
+    along_fractions: Sequence[float] = (-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0),
+) -> List[Tuple[float, float]]:
+    """World-frame points exactly on this block's own S=1 boundary surface.
+
+    Used to compute the Theorem-1 conservativeness correction. For each
+    along-axis fraction in [-1, 1], solves for the across-axis position
+    that keeps the point exactly on S=1 (closed-form since shape_exponent
+    is even), rather than using the (S>1, outside) bounding-rectangle
+    corners.
+    """
+
+    p = float(block.shape_exponent)
+    half_length_m = max(1.0e-6, float(block.half_length_m))
+    half_width_m = max(1.0e-6, float(block.half_width_m))
+    cos_h = math.cos(float(block.heading_rad))
+    sin_h = math.sin(float(block.heading_rad))
+
+    local_points: List[Tuple[float, float]] = []
+    for frac in along_fractions:
+        frac_clamped = min(1.0, max(-1.0, float(frac)))
+        along = frac_clamped * half_length_m
+        remainder = max(0.0, 1.0 - abs(frac_clamped) ** p)
+        across_mag = half_width_m * (remainder ** (1.0 / p))
+        if across_mag > 1.0e-9:
+            local_points.append((along, across_mag))
+            local_points.append((along, -across_mag))
+        else:
+            local_points.append((along, 0.0))
+
+    world_points: List[Tuple[float, float]] = []
+    for along, across in local_points:
+        x_m = float(block.x_center_m) + cos_h * along - sin_h * across
+        y_m = float(block.y_center_m) + sin_h * along + cos_h * across
+        world_points.append((x_m, y_m))
+    return world_points
+
+
+def road_envelope_conservativeness_correction(
+    blocks: Sequence[RoadEnvelopeBlock],
+    rho: float,
+) -> float:
+    """Theorem-1 correction epsilon0: min g_LSE over each block's own boundary.
+
+    Enforcing g_LSE(x,y) - epsilon0 <= 0 at runtime guarantees the resulting
+    feasible set stays inside the true (exact) union of blocks despite the
+    LogSumExp union's smooth optimism at the seam between blocks.
+    """
+
+    probe_points = [
+        point
+        for block in blocks
+        for point in road_envelope_block_boundary_probe_points_xy(block)
+    ]
+    if not probe_points:
+        return 0.0
+    lse_values = [
+        road_envelope_union_logsumexp(blocks, float(rho), x_m, y_m)[0]
+        for x_m, y_m in probe_points
+    ]
+    return float(min(lse_values))

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Callable, Dict, Mapping, Sequence
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -110,6 +110,71 @@ def _constant_acceleration_points(
     return points
 
 
+_NON_LANE_FOLLOWING_ACTOR_TYPES = {"pedestrian", "walker"}
+
+
+def _is_lane_following_actor(snapshot: Mapping[str, object]) -> bool:
+    """Vehicles are constrained to the lane network; pedestrians are not --
+    snapping a crossing pedestrian's prediction onto the nearest driving
+    lane would predict it walking along the road instead of across it."""
+
+    actor_type = str(
+        snapshot.get("actor_type", snapshot.get("type", ""))
+    ).strip().lower()
+    return actor_type not in _NON_LANE_FOLLOWING_ACTOR_TYPES
+
+
+def _lane_following_points(
+    snapshot: Mapping[str, object],
+    *,
+    horizon_s: float,
+    dt_s: float,
+    lane_step_fn: Callable[[float, float, float], Any],
+    model: str,
+    max_abs_acceleration_mps2: float,
+) -> list[dict] | None:
+    """Project an obstacle forward along its lane centerline instead of a
+    straight line, reusing the same speed/acceleration profile the
+    constant-velocity/-acceleration models already use.
+
+    Returns None (instead of a partial trajectory) the moment a step cannot
+    be resolved -- e.g. the obstacle is off-road, or the lane runs out before
+    the horizon -- so the caller falls back to straight-line extrapolation
+    for the whole horizon rather than silently mixing curved and straight
+    segments.
+    """
+
+    x_m = _safe_float(snapshot.get("x", 0.0))
+    y_m = _safe_float(snapshot.get("y", 0.0))
+    speed0_mps = max(0.0, _safe_float(snapshot.get("v", 0.0)))
+    accel_mps2 = 0.0
+    if str(model).strip().lower() in {"ca", "constant_acceleration", "constant-acceleration"}:
+        accel_mps2 = max(
+            -float(max_abs_acceleration_mps2),
+            min(float(max_abs_acceleration_mps2), _longitudinal_acceleration_mps2(snapshot)),
+        )
+    dt_s = max(1.0e-3, float(dt_s))
+    horizon_s = max(dt_s, float(horizon_s))
+    count = max(1, int(math.ceil(float(horizon_s) / float(dt_s))))
+
+    points: list[dict] = []
+    previous_speed_mps = speed0_mps
+    for step in range(1, count + 1):
+        t_s = float(dt_s * step)
+        current_speed_mps = max(0.0, speed0_mps + accel_mps2 * t_s)
+        step_distance_m = 0.5 * (previous_speed_mps + current_speed_mps) * dt_s
+        previous_speed_mps = current_speed_mps
+        if step_distance_m <= 1.0e-6:
+            points.append({"x": float(x_m), "y": float(y_m), "t": t_s, "v": float(current_speed_mps)})
+            continue
+        stepped = lane_step_fn(float(x_m), float(y_m), float(step_distance_m))
+        if stepped is None:
+            return None
+        x_m, y_m, _heading_rad = stepped
+        points.append({"x": float(x_m), "y": float(y_m), "t": t_s, "v": float(current_speed_mps)})
+    return points
+
+
 def obstacle_future_trajectory(
     snapshot: Mapping[str, object],
     *,
@@ -117,6 +182,7 @@ def obstacle_future_trajectory(
     dt_s: float,
     model: str = "constant_acceleration",
     max_abs_acceleration_mps2: float = 4.0,
+    lane_step_fn: Callable[[float, float, float], Any] | None = None,
 ) -> list[dict]:
     points = _trajectory_points(snapshot)
     if len(points) > 0:
@@ -125,6 +191,17 @@ def obstacle_future_trajectory(
             for point in points
             if 0.0 <= float(point.get("t", 0.0)) <= float(horizon_s)
         ]
+    if lane_step_fn is not None and _is_lane_following_actor(snapshot):
+        lane_points = _lane_following_points(
+            snapshot,
+            horizon_s=float(horizon_s),
+            dt_s=float(dt_s),
+            lane_step_fn=lane_step_fn,
+            model=str(model),
+            max_abs_acceleration_mps2=float(max_abs_acceleration_mps2),
+        )
+        if lane_points is not None:
+            return lane_points
     if str(model).strip().lower() in {"ca", "constant_acceleration", "constant-acceleration"}:
         return _constant_acceleration_points(
             snapshot,
@@ -148,6 +225,7 @@ def lane_prediction_risk(
     min_ttc_s: float = 2.5,
     prediction_model: str = "constant_acceleration",
     max_abs_acceleration_mps2: float = 4.0,
+    lane_step_fn: Callable[[float, float, float], Any] | None = None,
 ) -> Dict[str, object]:
     """Estimate whether a lane will stay safe over a short future horizon.
 
@@ -185,6 +263,7 @@ def lane_prediction_risk(
             dt_s=float(dt_s),
             model=str(prediction_model),
             max_abs_acceleration_mps2=float(max_abs_acceleration_mps2),
+            lane_step_fn=lane_step_fn,
         )
         for point in points:
             t_s = max(0.0, _safe_float(point.get("t", 0.0)))

@@ -545,7 +545,7 @@ class RuleBasedBehaviorPlanner:
         nearest_front_obstacles_by_lane: Mapping[int, Mapping[str, object]] | None = None,
         lane_prediction_risks: Mapping[int, Mapping[str, object]] | None = None,
         preferred_target_lane_id: int | None = None,
-        lane_closure_messages: Sequence[Mapping[str, object]] | None = None,
+        lane_change_completion_allowed: bool = True,
     ) -> BehaviorCommand:
         """
         Run one planning cycle.
@@ -584,6 +584,10 @@ class RuleBasedBehaviorPlanner:
                                  the strategy layer. The FSM still validates
                                  safety and prediction risk before preparing
                                  or executing a lane change.
+        lane_change_completion_allowed : false while the downstream maneuver
+                                 manager still owns a locked lane-change
+                                 trajectory. This keeps both state machines on
+                                 the same geometric release boundary.
 
         Returns
         -------
@@ -638,6 +642,7 @@ class RuleBasedBehaviorPlanner:
         if str(planner_mode) != str(self._last_mode):
             self._reset_lane_change_state(reason="reset")
         self._last_mode = str(planner_mode)
+
         (
             cp_lane_closure_messages,
             cp_control_messages,
@@ -645,7 +650,6 @@ class RuleBasedBehaviorPlanner:
         ) = self._cooperative_messages(
             current_time_s=current_time_s,
             wall_time_s=wall_time_s,
-            lane_closure_messages=lane_closure_messages,
         )
         reroute_messages = self._poll_cooperative_messages(
             current_messages=cp_lane_closure_messages,
@@ -795,7 +799,11 @@ class RuleBasedBehaviorPlanner:
         # -------------------------------------------------------------- #
         # Lane-change completion (checked first)                            #
         # -------------------------------------------------------------- #
-        if self._is_execute_lane_change_state() and self._target_lane_id is not None:
+        if (
+            bool(lane_change_completion_allowed)
+            and self._is_execute_lane_change_state()
+            and self._target_lane_id is not None
+        ):
             if self._lane_change_complete(
                 ego_lane_id=ego_lane_id,
                 target_lane_id=self._target_lane_id,
@@ -1534,20 +1542,7 @@ class RuleBasedBehaviorPlanner:
         *,
         current_time_s: float | None,
         wall_time_s: float | None,
-        lane_closure_messages: Sequence[Mapping[str, object]] | None = None,
     ) -> tuple[list[dict], list[dict], bool]:
-        
-        # ROS supplies lane events directly, but keep the same polling period and cache used by OpenCDA.
-        if lane_closure_messages is not None:
-            refreshed = self._should_check_cooperative_messages(current_time_s=current_time_s, wall_time_s=wall_time_s)
-            if refreshed:
-                self._cached_lane_closure_messages = [dict(message) for message in list(lane_closure_messages or []) if isinstance(message, Mapping) and str(message.get("id", "")).strip() and str(message.get("type", "")).strip().lower() == "lane_closure" and str(message.get("id", "")).strip() not in self._acknowledged_reroute_ids]
-                self._cached_control_messages = []
-                check_time_s = self._cooperative_message_check_reference_time_s(current_time_s=current_time_s, wall_time_s=wall_time_s)
-                if check_time_s is not None:
-                    self._last_cp_message_check_time_s = float(check_time_s)
-            return [dict(message) for message in self._cached_lane_closure_messages], [], bool(refreshed)
-        
         if not self._cp_message_path:
             return [], [], False
 
@@ -3021,7 +3016,18 @@ class RuleBasedBehaviorPlanner:
         signal_match_distance_m = None
         signal_match_rank = None
         signal_actor_raw_state = ""
+        scenario_owns_traffic_control = False
+        scenario_fsm_state = ""
         if isinstance(traffic_signal_context, Mapping):
+            scenario_owns_traffic_control = bool(
+                traffic_signal_context.get(
+                    "scenario_owns_traffic_control",
+                    False,
+                )
+            )
+            scenario_fsm_state = str(
+                traffic_signal_context.get("scenario_fsm_state", "")
+            )
             signal_found = bool(traffic_signal_context.get("signal_found", False))
             signal_actor_id = traffic_signal_context.get("signal_actor_id", None)
             signal_actor_name = str(traffic_signal_context.get("signal_actor_name", ""))
@@ -3059,6 +3065,20 @@ class RuleBasedBehaviorPlanner:
         # `stop` incorrectly.
         release_for_green = str(normalized_signal_state) == "green"
         should_release_latch = bool(ego_in_junction) or bool(release_for_green)
+        if (
+            bool(scenario_owns_traffic_control)
+            and str(self._active_control_message_type) == "legacy_traffic_light"
+            and (
+                str(normalized_signal_state) not in {"red", "yellow"}
+                or not isinstance(traffic_stop_target, Mapping)
+            )
+        ):
+            # CPXScenarioManager owns approach/commit/hold/release. During a
+            # distant-red approach it intentionally passes unknown + no stop
+            # target so Behavior cannot convert the approach into an immediate
+            # stop. Release only this legacy traffic-light latch; obstacle and
+            # CP control stops retain their independent ownership.
+            should_release_latch = True
         if should_release_latch:
             self._clear_stop_state()
 
@@ -3118,6 +3138,10 @@ class RuleBasedBehaviorPlanner:
             "should_stop_now": bool(should_stop_now),
             "stop_latched": bool(self._stop),
             "stop_decision_active": bool(self._stop),
+            "scenario_owns_traffic_control": bool(
+                scenario_owns_traffic_control
+            ),
+            "scenario_fsm_state": str(scenario_fsm_state),
             "latched_signal_actor_id": self._active_control_message_id,
             "control_found": bool(signal_found),
             "control_type": "traffic_light" if bool(signal_found) else "",

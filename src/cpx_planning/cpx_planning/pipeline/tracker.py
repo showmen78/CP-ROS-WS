@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
-from .prediction import PredictionFrame, build_prediction_frame
+from cpx_planning.pipeline.prediction import (
+    PredictionFrame,
+    build_prediction_frame,
+)
 
 
 class CPXObstacleTracker:
@@ -48,7 +51,6 @@ class CPXObstacleTracker:
                 continue
             normalized = dict(snapshot)
             key = self._track_key(normalized)
-            active_keys.add(str(key))
             previous = self._tracks.get(str(key))
             valid, reason = self._valid_transition(
                 previous=previous,
@@ -58,6 +60,7 @@ class CPXObstacleTracker:
             if not bool(valid):
                 rejected_reasons.append(str(reason))
                 continue
+            active_keys.add(str(key))
             normalized["track_id"] = str(key)
             normalized["track_age_s"] = 0.0
             normalized["track_stale"] = False
@@ -93,7 +96,12 @@ class CPXObstacleTracker:
         self._signal_context = dict(signal_context or {})
         self._stop_target = dict(stop_target or {}) if isinstance(stop_target, Mapping) else None
         self._last_stale_count = int(stale_count)
-        if rejected_reasons:
+        if rejected_reasons and stale_count:
+            self._last_validity_reason = (
+                f"tracker_rejected_held_by_ttl:{int(stale_count)}:"
+                + ",".join(sorted(set(rejected_reasons))[:3])
+            )
+        elif rejected_reasons:
             self._last_validity_reason = "tracker_rejected:" + ",".join(sorted(set(rejected_reasons))[:3])
         elif stale_count:
             self._last_validity_reason = f"tracker_ttl_hold:{int(stale_count)}"
@@ -114,6 +122,7 @@ class CPXObstacleTracker:
         min_ttc_s: float,
         prediction_model: str = "constant_acceleration",
         max_abs_acceleration_mps2: float = 4.0,
+        lane_step_fn: Optional[Callable[[float, float, float], Any]] = None,
     ) -> PredictionFrame:
         return build_prediction_frame(
             ego_snapshot=ego_snapshot,
@@ -127,6 +136,7 @@ class CPXObstacleTracker:
             min_ttc_s=float(min_ttc_s),
             prediction_model=str(prediction_model),
             max_abs_acceleration_mps2=float(max_abs_acceleration_mps2),
+            lane_step_fn=lane_step_fn,
         )
 
     @property

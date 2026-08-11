@@ -72,14 +72,7 @@ class LocalizationPublisher(Node):
 
             self.publisher.publish(message)
             
-            #publishing the final destination
-            # OpenCDA includes the current final destination in the localization TCP
-            # payload. Publish it separately so the ROS planner can create its route.
-            final_destination = payload.get("final_destination")
-            
-            
-            # OpenCDA includes the current final destination in the localization TCP
-            # payload. Publish it separately so the ROS planner can create its route.
+            # The destination is a mission input, not an odometry field.
             final_destination = payload.get("final_destination")
 
             if isinstance(final_destination, dict):
@@ -105,6 +98,7 @@ class LocalizationPublisher(Node):
                 destination_message.pose.orientation.w = 1.0
 
                 self.destination_publisher.publish(destination_message)
+
 
     def destroy_node(self):
         self.receiver.close()

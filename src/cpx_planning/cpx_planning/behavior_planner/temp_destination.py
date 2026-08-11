@@ -58,31 +58,39 @@ _cached_cum_dists: List[float] = []
 
 def _waypoint_xy(waypoint) -> tuple[float, float]:
     position = getattr(waypoint, "position", None)
-    if not isinstance(position, Mapping):
-        raise AttributeError("Custom waypoint does not contain a position.")
-    return float(position["x"]), float(position["y"])
+    if isinstance(position, Mapping):
+        return float(position["x"]), float(position["y"])
+    raise AttributeError("Custom waypoint has no position.")
 
 
 def _waypoint_xyz(waypoint) -> Dict[str, float]:
     position = getattr(waypoint, "position", None)
     if not isinstance(position, Mapping):
-        raise AttributeError("Custom waypoint does not contain a position.")
-    return {
-        "x": float(position["x"]),
-        "y": float(position["y"]),
-        "z": float(position.get("z", 0.0)),
-    }
+        raise AttributeError("Custom waypoint has no position.")
+    return {"x": float(position["x"]), "y": float(position["y"]), "z": float(position.get("z", 0.0))}
 
 
 def _waypoint_z(waypoint, default_z: float = 0.0) -> float:
     position = getattr(waypoint, "position", None)
-    if not isinstance(position, Mapping):
-        return float(default_z)
-    return float(position.get("z", default_z))
+    if isinstance(position, Mapping):
+        return float(position.get("z", default_z))
+    return float(default_z)
 
 
 def _waypoint_heading_rad(waypoint) -> float:
     return float(world_heading_rad(waypoint) or 0.0)
+
+
+def _waypoint_is_junction(waypoint: Any) -> bool:
+    """Normalize custom-map and CARLA junction semantics."""
+
+    return bool(
+        getattr(
+            waypoint,
+            "is_intersection",
+            getattr(waypoint, "is_junction", False),
+        )
+    )
 
 
 def _project_waypoint(map_planner, point) -> object | None:
@@ -314,7 +322,7 @@ def _snap_junction_waypoint_to_route(
     anchor_arc_m: float,
 ) -> Any:
     """Snap an off-route junction waypoint back onto the remaining route."""
-    if waypoint is None or not bool(getattr(waypoint, "is_intersection", False)):
+    if waypoint is None or not _waypoint_is_junction(waypoint):
         return waypoint
 
     route_arc_m, route_distance_m, route_heading_error_rad = _route_match_metrics(
@@ -375,6 +383,7 @@ def _walk_forward(
     cum_dists: Sequence[float] | None = None,
     maneuver: str | None = None,
     target_position: Mapping[str, object] | None = None,
+    target_wp: Any = None,
 ) -> Any:
     """Walk *wp* forward by *distance_m* using ``wp.next()``.
 
@@ -384,6 +393,8 @@ def _walk_forward(
     available, *target_position* is used next, then maneuver bias, then the
     straightest successor.
     """
+    if target_position is None and target_wp is not None:
+        target_position = _waypoint_xyz(target_wp)
     target_xy = (
         None
         if target_position is None
@@ -579,7 +590,7 @@ def move_to_lane(
     """
     if wp is None:
         return wp
-    if bool(getattr(wp, "is_intersection", False)) and not bool(allow_junction_lane_snap):
+    if _waypoint_is_junction(wp) and not bool(allow_junction_lane_snap):
         return wp
     return canonical_lane_waypoint_for_lane_id(wp, int(target_lane_id))
 
@@ -591,7 +602,13 @@ def _internal_lane_id(wp: Any) -> int:
 
 def _lane_width_m(waypoint: Any, default_m: float = 0.0) -> float:
     try:
-        lane_width_m = float(getattr(waypoint, "lane_width_m", default_m))
+        lane_width_m = float(
+            getattr(
+                waypoint,
+                "lane_width_m",
+                getattr(waypoint, "lane_width", default_m),
+            )
+        )
     except Exception:
         lane_width_m = float(default_m)
     if not math.isfinite(lane_width_m) or lane_width_m <= 0.0:
@@ -701,7 +718,7 @@ def _determine_mode(
     del intersection_threshold_m
     del next_macro_maneuver
 
-    ego_in_junction = bool(getattr(ego_wp, "is_intersection", False))
+    ego_in_junction = _waypoint_is_junction(ego_wp)
     was_intersection = prev_mode is not None and float(prev_mode) > 0.5
     entered_intersection = bool(prev_entered_intersection) or bool(ego_in_junction)
 
@@ -980,7 +997,7 @@ def _should_follow_turn_branch_from_route(
     )
 
 
-def _route_waypoint_from_anchor(
+def _route_waypoint_from_anchor_impl(
     map_planner: Any,
     anchor_wp: Any,
     route_points: Sequence[Sequence[float]],
@@ -1019,7 +1036,7 @@ def _route_waypoint_from_anchor(
     if (
         not bool(follow_route_lane)
         and route_wp is not None
-        and bool(getattr(route_wp, "is_intersection", False))
+        and _waypoint_is_junction(route_wp)
         and fallback_wp is not None
     ):
         resolved_wp = fallback_wp
@@ -1040,7 +1057,7 @@ def _route_waypoint_from_anchor(
     )
 
 
-def _build_route_reference_samples_from_anchor(
+def _build_route_reference_samples_from_anchor_impl(
     map_planner: Any,
     anchor_wp: Any,
     route_points: Sequence[Sequence[float]],
@@ -1546,7 +1563,7 @@ def _blend_reference_samples(
 # -------------------------------------------------------------------- #
 # Public API                                                             #
 # -------------------------------------------------------------------- #
-def compute_temp_destination_mode(
+def _compute_temp_destination_mode_impl(
     map_planner: Any,
     ego_pose: Mapping[str, object],
     mode_reference_xy: Tuple[float, float] | None = None,
@@ -1599,7 +1616,7 @@ def compute_temp_destination_mode(
     )
 
 
-def compute_temp_destination(
+def _compute_temp_destination_impl(
     map_planner: Any,
     ego_pose: Mapping[str, object],
     target_lane_id: int,
@@ -1886,7 +1903,7 @@ def compute_temp_destination(
     ]
 
 
-def build_reference_samples(
+def _build_reference_samples_impl(
     map_planner: Any,
     ego_pose: Mapping[str, object],
     target_lane_id: int,
@@ -2080,6 +2097,57 @@ def build_reference_samples(
         )
 
     return target_samples if len(target_samples) > 0 else source_samples
+
+
+def _legacy_map_call_kwargs(kwargs: Mapping[str, object]) -> Dict[str, object]:
+    """Keep the existing wrapper while accepting only custom-map arguments."""
+
+    return dict(kwargs)
+
+
+def _build_route_reference_samples_from_anchor(*args, **kwargs):
+    """Compatibility boundary for CARLA-map and planner-map callers."""
+
+    return _build_route_reference_samples_from_anchor_impl(
+        *args,
+        **_legacy_map_call_kwargs(kwargs),
+    )
+
+
+def _route_waypoint_from_anchor(*args, **kwargs):
+    """Compatibility boundary for legacy CARLA map arguments."""
+
+    return _route_waypoint_from_anchor_impl(
+        *args,
+        **_legacy_map_call_kwargs(kwargs),
+    )
+
+
+def compute_temp_destination_mode(*args, **kwargs):
+    """Compute mode after normalizing legacy CARLA boundary arguments."""
+
+    return _compute_temp_destination_mode_impl(
+        *args,
+        **_legacy_map_call_kwargs(kwargs),
+    )
+
+
+def compute_temp_destination(*args, **kwargs):
+    """Compute a destination through the canonical mapping-based API."""
+
+    return _compute_temp_destination_impl(
+        *args,
+        **_legacy_map_call_kwargs(kwargs),
+    )
+
+
+def build_reference_samples(*args, **kwargs):
+    """Build reference samples through the canonical mapping-based API."""
+
+    return _build_reference_samples_impl(
+        *args,
+        **_legacy_map_call_kwargs(kwargs),
+    )
 
 
 def compute_ego_lane_offset(

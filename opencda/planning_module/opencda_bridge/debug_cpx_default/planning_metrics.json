@@ -1,0 +1,17 @@
+{
+  "scenario_name": "opencda_scenario",
+  "summary": {
+    "collision_count": 0,
+    "distance_traveled_m": 0.0,
+    "collision_rate_per_km": 0.0,
+    "min_ttc_s": null,
+    "min_pet_s": null,
+    "max_drac_mps2": 0.0,
+    "road_boundary_breach_count": 0,
+    "road_boundary_sample_count": 0,
+    "road_boundary_breach_rate": null,
+    "mpc_plan_attempts": 0,
+    "mpc_plan_successes": 0,
+    "mpc_plan_success_rate": 0.0
+  }
+}

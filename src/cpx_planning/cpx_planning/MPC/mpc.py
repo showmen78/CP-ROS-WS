@@ -33,6 +33,7 @@ Cost function:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import math
 import time
@@ -43,9 +44,12 @@ import scipy.sparse as sp
 
 from .lane_keep import (
     LaneKeepingProfile,
+    RoadEnvelopeBlock,
     evaluate_lane_keeping_profile,
     normalize_lane_reference_sample,
+    road_envelope_union_logsumexp,
     signed_lateral_offset_affine_form,
+    signed_longitudinal_progress_affine_form,
 )
 
 try:
@@ -129,6 +133,17 @@ class MPCRepulsivePotentialSpec:
     max_lateral_zone_lane_fraction: float
     project_hessian_psd: bool
     min_hessian_eig: float
+    log_barrier_enabled: bool
+    log_barrier_replace_exponential: bool
+    w_log_barrier: float
+    log_barrier_gain: float
+    # Off by default. When on, the cost's cross-track (lateral, relative to
+    # ego's own stage heading) gradient/Hessian contribution is scaled down
+    # for a nearly-straight-ahead obstacle, leaving the along-track (braking)
+    # contribution untouched -- see _cross_track_lateral_scale.
+    cross_track_suppression_enabled: bool
+    cross_track_full_suppression_m: float
+    cross_track_full_response_m: float
 
 
 @dataclass
@@ -137,13 +152,15 @@ class QPIndex:
     Decision-variable indexing helper.
 
     Variable layout:
-        z = [X(0..N), U(0..N-1), S_road_left/right(1..N)]
+        z = [X(0..N), U(0..N-1), S_road_left/right(1..N), S_speed(1..N), S_envelope(1..N)]
     """
 
     nx: int
     nu: int
     horizon_steps: int
     road_boundary_slack_pair_count: int = 0
+    speed_slack_count: int = 0
+    road_envelope_slack_count: int = 0
 
     @property
     def state_offset(self) -> int:
@@ -162,8 +179,16 @@ class QPIndex:
         return 2 * int(self.road_boundary_slack_pair_count)
 
     @property
-    def total_variables(self) -> int:
+    def speed_slack_offset(self) -> int:
         return self.road_boundary_slack_offset + self.road_boundary_slack_count
+
+    @property
+    def road_envelope_slack_offset(self) -> int:
+        return self.speed_slack_offset + int(self.speed_slack_count)
+
+    @property
+    def total_variables(self) -> int:
+        return self.road_envelope_slack_offset + int(self.road_envelope_slack_count)
 
     def state_index(self, k: int, i: int) -> int:
         return self.state_offset + k * self.nx + i
@@ -176,6 +201,12 @@ class QPIndex:
 
     def road_boundary_right_slack_index(self, k: int) -> int:
         return self.road_boundary_slack_offset + 2 * (k - 1) + 1
+
+    def speed_slack_index(self, k: int) -> int:
+        return self.speed_slack_offset + (k - 1)
+
+    def road_envelope_slack_index(self, k: int) -> int:
+        return self.road_envelope_slack_offset + (k - 1)
 
 
 class MPC:
@@ -215,6 +246,38 @@ class MPC:
             raise ValueError("mpc.horizon_s and mpc.plan_dt_s must be > 0.")
         self.horizon_steps = max(1, int(round(self.horizon_s / self.dt_s)))
         self.horizon_s = float(self.horizon_steps * self.dt_s)
+
+        # Off by default: horizon_s above governs everything unless a caller
+        # (the bridge, per behavior mode + obstacle state) explicitly drives
+        # blend_toward_horizon_s every tick. _build_qp rebuilds the QP fresh
+        # from self.horizon_steps on every call (no persisted OSQP problem),
+        # so changing it between ticks needs no other special handling.
+        self.adaptive_horizon_enabled = bool(
+            mpc_cfg.get("adaptive_horizon_enabled", False)
+        )
+        self.adaptive_horizon_min_s = max(
+            self.dt_s, float(mpc_cfg.get("adaptive_horizon_min_s", 1.0))
+        )
+        self.adaptive_horizon_max_s = max(
+            float(self.adaptive_horizon_min_s),
+            float(mpc_cfg.get("adaptive_horizon_max_s", 5.0)),
+        )
+        # blend_toward_horizon_s only actually applies a change once the
+        # blended value has drifted at least this many steps from the
+        # current horizon_steps. _build_shifted_previous_solution_seed drops
+        # the warm start outright on ANY horizon_steps change (a shape
+        # mismatch), so continuously drifting it by 1 step almost every tick
+        # (e.g. while a lead vehicle's distance shrinks smoothly) forces a
+        # cold-start solve nearly every tick, producing small solve-to-solve
+        # steering jitter even on an otherwise straight lane-follow. Holding
+        # steady between coarser jumps lets the warm start survive across
+        # most ticks.
+        self.adaptive_horizon_min_step_change = max(
+            1, int(mpc_cfg.get("adaptive_horizon_min_step_change", 3))
+        )
+        # Continuously-tracked blend target, independent of the committed
+        # (possibly held-steady) self.horizon_s -- see blend_toward_horizon_s.
+        self._adaptive_horizon_continuous_s = float(self.horizon_s)
 
         self.trajectory_generation_frequency_hz = max(
             1e-3,
@@ -349,6 +412,23 @@ class MPC:
                 0.0,
                 float(repulsive_cfg.get("min_hessian_eig", repulsive_cfg.get("taylor_min_hessian_eig", 1e-9))),
             ),
+            log_barrier_enabled=bool(repulsive_cfg.get("log_barrier_enabled", False)),
+            log_barrier_replace_exponential=bool(
+                repulsive_cfg.get("log_barrier_replace_exponential", False)
+            ),
+            w_log_barrier=max(0.0, float(repulsive_cfg.get("w_log_barrier", 0.0))),
+            log_barrier_gain=max(1e-6, float(repulsive_cfg.get("log_barrier_gain", 4.0))),
+            cross_track_suppression_enabled=bool(
+                repulsive_cfg.get("cross_track_suppression_enabled", False)
+            ),
+            cross_track_full_suppression_m=max(
+                0.0,
+                float(repulsive_cfg.get("cross_track_full_suppression_m", 1.0)),
+            ),
+            cross_track_full_response_m=max(
+                float(repulsive_cfg.get("cross_track_full_suppression_m", 1.0)) + 1e-6,
+                float(repulsive_cfg.get("cross_track_full_response_m", 2.0)),
+            ),
         )
 
         lane_center_cfg = dict(cost_cfg.get("lane_center_follow", {}))
@@ -399,6 +479,55 @@ class MPC:
             float(road_boundary_cfg.get("max_slack_m", 0.25)),
         )
         self.lane_keep_boundary_weight = float(self.road_boundary_weight)
+
+        # Road-envelope block-union hard constraint (Yu et al.,
+        # "Spatial Envelope MPC," arXiv:2509.18506, Sec. III-B1). Off by
+        # default: this only ever activates when the bridge explicitly
+        # supplies `road_envelope_blocks` to plan_trajectory (during a
+        # locked route-tracking lane change), and even then only when this
+        # flag is also on. Replaces the single-reference-line
+        # `road_boundary` constraint for that call only -- the union of two
+        # *static* blocks (source lane + target lane, fixed once at lock
+        # time) stays satisfiable even as the tracked reference switches
+        # lanes mid-maneuver, unlike a line tied to whichever reference
+        # sample is active that tick.
+        road_envelope_cfg = dict(cost_cfg.get("road_envelope", {}))
+        self.road_envelope_enabled = bool(road_envelope_cfg.get("enabled", False))
+        self.road_envelope_weight = max(
+            0.0,
+            float(road_envelope_cfg.get("w_envelope", 10000.0)),
+        )
+        self.road_envelope_max_slack_m = max(
+            0.0,
+            float(road_envelope_cfg.get("max_slack_m", 0.10)),
+        )
+        self.road_envelope_shape_exponent = max(
+            2.0,
+            float(road_envelope_cfg.get("shape_exponent", 4.0)),
+        )
+        self.road_envelope_rho = min(
+            -1.0e-6,
+            float(road_envelope_cfg.get("rho", -8.0)),
+        )
+
+        # Speed upper-bound soft constraint. Disabled by default: the hard
+        # per-stage bound (`add_constraint(..., min_velocity_mps,
+        # stage_speed_upper_bound_mps)` in _build_qp) is kept exactly as
+        # before unless this is explicitly enabled. When enabled, a per-stage
+        # slack absorbs overshoot above the posted cap (mirrors the
+        # road-boundary slack pattern above), penalized quadratically and
+        # itself hard-capped at speed_soft_max_slack_mps so the softened
+        # constraint cannot be violated without bound.
+        speed_soft_cfg = dict(cost_cfg.get("speed_soft_constraint", {}))
+        self.speed_soft_constraint_enabled = bool(speed_soft_cfg.get("enabled", False))
+        self.speed_soft_constraint_weight = max(
+            0.0,
+            float(speed_soft_cfg.get("weight", 200.0)),
+        )
+        self.speed_soft_max_slack_mps = max(
+            0.0,
+            float(speed_soft_cfg.get("max_slack_mps", 3.0)),
+        )
         self.lane_keep_safe_region_alpha = min(
             0.999999,
             max(
@@ -415,10 +544,39 @@ class MPC:
             0,
             int(lane_center_cfg.get("local_stage_window", 2)),
         )
+        # Arc-length ("Frenet-like") lane-reference lookup: off by default,
+        # preserving today's array-index/local-window lookup exactly. When
+        # enabled, each stage's lane-center sample is selected by how far
+        # along the reference path that stage's own rollout position has
+        # actually traveled, instead of by its position in the array --
+        # the two only coincide on a straight reference built at exactly the
+        # nominal step distance, so this specifically targets curved-road
+        # reference inconsistency. See _get_lane_center_stage_sample_by_progress.
+        self.lane_center_follow_use_progress_lookup = bool(
+            lane_center_cfg.get("use_progress_lookup", False)
+        )
+        # When true, the raw world-(x,y) centerline_xy_weight pull is
+        # decomposed into lane-local longitudinal/lateral components instead
+        # of independently attracting raw x and y (which couples world-frame
+        # x/y errors together and doesn't rotate with lane heading the way
+        # the lateral-offset term already does). Off by default, preserving
+        # today's per-mode-profile tuning until validated.
+        self.lane_center_follow_xy_uses_frenet_decomposition = bool(
+            lane_center_cfg.get("xy_term_uses_frenet_decomposition", False)
+        )
 
         self.reference_cfg = dict(mpc_cfg.get("reference_rollout", {}))
         self.reference_heading_gain = float(self.reference_cfg.get("heading_gain", 1.6))
         self.reference_speed_gain = float(self.reference_cfg.get("speed_gain", 1.2))
+        self.reference_speed_upper_bound_margin_mps = max(
+            0.0,
+            float(
+                self.reference_cfg.get(
+                    "speed_upper_bound_margin_mps",
+                    0.5,
+                )
+            ),
+        )
         self.reference_prefer_lane_center_path = bool(self.reference_cfg.get("prefer_lane_center_path", True))
         self.reference_path_los_heading_blend = min(
             1.0,
@@ -453,6 +611,15 @@ class MPC:
                 )
             ),
         )
+        self.solver_failure_log_every_n = max(
+            1,
+            int(self.reference_cfg.get("solver_failure_log_every_n", 50)),
+        )
+        self.log_solution_memory_resets = bool(
+            self.reference_cfg.get("log_solution_memory_resets", False)
+        )
+        self._solver_failure_log_event_count = 0
+        self._solver_failure_emergency_logged = False
         self.reference_previous_solution_search_steps = max(
             0,
             int(self.reference_cfg.get("previous_solution_search_steps", 15)),
@@ -533,8 +700,10 @@ class MPC:
             "Cost_Lane": 0.0,
             "Cost_Repulsive_Safe": 0.0,
             "Cost_Repulsive_Collision": 0.0,
+            "Cost_Repulsive_LogBarrier": 0.0,
             "Cost_Repulsive": 0.0,
             "Cost_Control": 0.0,
+            "Cost_VelocitySlack": 0.0,
         }
         self._last_lane_keeping_profile = LaneKeepingProfile(stage_metrics=tuple(), total_cost=0.0)
         self._last_x_solution: np.ndarray | None = None
@@ -568,6 +737,10 @@ class MPC:
             "road_boundary_w": float(self.road_boundary_weight),
             "road_boundary_margin_m": float(self.road_boundary_margin_m),
             "road_boundary_max_slack_m": float(self.road_boundary_max_slack_m),
+            "road_envelope_w": float(self.road_envelope_weight),
+            "road_envelope_max_slack_m": float(self.road_envelope_max_slack_m),
+            "speed_soft_constraint_w": float(self.speed_soft_constraint_weight),
+            "speed_soft_max_slack_mps": float(self.speed_soft_max_slack_mps),
         }
 
     @staticmethod
@@ -608,6 +781,10 @@ class MPC:
             "road_boundary_w": ("road_boundary_w", "road_boundary_weight", "w_boundary"),
             "road_boundary_margin_m": ("road_boundary_margin_m", "road_boundary_margin"),
             "road_boundary_max_slack_m": ("road_boundary_max_slack_m", "road_boundary_max_slack"),
+            "road_envelope_w": ("road_envelope_w", "road_envelope_weight", "w_envelope"),
+            "road_envelope_max_slack_m": ("road_envelope_max_slack_m", "road_envelope_max_slack"),
+            "speed_soft_constraint_w": ("speed_soft_constraint_w", "speed_soft_constraint_weight"),
+            "speed_soft_max_slack_mps": ("speed_soft_max_slack_mps",),
         }
         for canonical_key, key_aliases in aliases.items():
             value = self._profile_value(raw_profile, *key_aliases)
@@ -655,8 +832,63 @@ class MPC:
         self.lane_keep_boundary_weight = float(self.road_boundary_weight)
         self.road_boundary_margin_m = float(blended["road_boundary_margin_m"])
         self.road_boundary_max_slack_m = float(blended["road_boundary_max_slack_m"])
+        self.road_envelope_weight = float(blended["road_envelope_w"])
+        self.road_envelope_max_slack_m = float(blended["road_envelope_max_slack_m"])
+        self.speed_soft_constraint_weight = float(blended["speed_soft_constraint_w"])
+        self.speed_soft_max_slack_mps = float(blended["speed_soft_max_slack_mps"])
         self.active_cost_profile_name = str(normalized_profile)
         return str(normalized_profile)
+
+    def blend_toward_horizon_s(
+        self, target_horizon_s: float, *, blend_alpha: float | None = None
+    ) -> float:
+        """Smoothly move the prediction horizon toward target_horizon_s.
+
+        Clamped to [adaptive_horizon_min_s, adaptive_horizon_max_s]. No
+        persisted OSQP problem depends on horizon_steps between calls (see
+        _build_qp), so changing horizon_steps here needs no other special
+        handling -- the next plan_trajectory call just builds a
+        differently-sized QP.
+
+        However, _build_shifted_previous_solution_seed drops MPC's warm
+        start on ANY horizon_steps change (an exact-shape check), so
+        committing a new horizon_steps every single call -- e.g. while a
+        lead vehicle's distance shrinks smoothly and the target drifts by
+        a fraction of a step each tick -- forces a cold-start solve nearly
+        every tick, which shows up as small solve-to-solve steering noise
+        even during otherwise-straight lane_follow. To avoid that, the
+        continuous blend target is tracked every call (so it never lags
+        behind target_horizon_s), but self.horizon_steps/self.horizon_s --
+        the values actually used to build the QP -- are only updated once
+        the continuous target has drifted at least
+        adaptive_horizon_min_step_change steps away from the currently
+        committed value. Most ticks hold steady and keep their warm start;
+        only once the drift accumulates enough does the horizon jump.
+        """
+        alpha = (
+            float(self.mode_cost_profile_blend_alpha)
+            if blend_alpha is None
+            else float(blend_alpha)
+        )
+        alpha = min(1.0, max(0.0, alpha))
+        target = min(
+            float(self.adaptive_horizon_max_s),
+            max(float(self.adaptive_horizon_min_s), float(target_horizon_s)),
+        )
+        self._adaptive_horizon_continuous_s = (
+            float(self._adaptive_horizon_continuous_s) * (1.0 - alpha)
+            + target * alpha
+        )
+        candidate_steps = max(
+            1, int(round(self._adaptive_horizon_continuous_s / self.dt_s))
+        )
+        if (
+            abs(candidate_steps - self.horizon_steps)
+            >= self.adaptive_horizon_min_step_change
+        ):
+            self.horizon_steps = candidate_steps
+            self.horizon_s = float(self.horizon_steps * self.dt_s)
+        return self.horizon_s
 
     def should_replan(self, sim_time_s: float) -> bool:
         """Return True when enough simulation time has elapsed for a new plan.
@@ -713,6 +945,12 @@ class MPC:
         if not math.isfinite(road_right_width_m) or road_right_width_m <= 0.0:
             road_right_width_m = float(fallback_half_width_m)
 
+        progress_m = sample.get("progress_m", float("nan"))
+        try:
+            progress_m = float(progress_m)
+        except (TypeError, ValueError):
+            progress_m = float("nan")
+
         return {
             "x_ref_m": float(sample.get("x_ref_m", 0.0)),
             "y_ref_m": float(sample.get("y_ref_m", 0.0)),
@@ -722,6 +960,7 @@ class MPC:
             "road_center_offset_m": float(road_center_offset_m),
             "road_left_width_m": float(road_left_width_m),
             "road_right_width_m": float(road_right_width_m),
+            "progress_m": float(progress_m),
         }
 
     @staticmethod
@@ -803,6 +1042,105 @@ class MPC:
             stage_index=int(stage_index),
             query_x_m=query_x_m,
             query_y_m=query_y_m,
+        )
+        if sample is None:
+            return None
+        return (
+            float(sample.get("x_ref_m", 0.0)),
+            float(sample.get("y_ref_m", 0.0)),
+            float(sample.get("heading_rad", 0.0)),
+        )
+
+    def _get_lane_center_stage_sample_by_progress(
+        self,
+        lane_center_reference: Sequence[Mapping[str, object]] | None,
+        query_progress_m: float,
+    ) -> Dict[str, float] | None:
+        """Arc-length ("Frenet-like") lane-reference lookup.
+
+        Interpolates between the two reference samples bracketing
+        `query_progress_m`, instead of indexing by stage number -- this is
+        what makes the lookup follow how far the vehicle has actually
+        traveled along a curve rather than which array position it happens
+        to occupy (the two only coincide on a straight reference built at
+        exactly the nominal step distance).
+
+        Returns None (falls back to index/local-window lookup at the call
+        site) if the reference is empty or any sample lacks a finite
+        `progress_m` tag -- older/partial reference data degrades gracefully
+        instead of crashing.
+        """
+
+        if lane_center_reference is None or len(lane_center_reference) == 0:
+            return None
+
+        valid_samples: List[Dict[str, float]] = []
+        for sample in lane_center_reference:
+            if not isinstance(sample, Mapping):
+                continue
+            normalized_sample = self._normalized_lane_reference_sample_dict(sample)
+            if normalized_sample is None:
+                continue
+            if not math.isfinite(float(normalized_sample.get("progress_m", float("nan")))):
+                return None
+            valid_samples.append(normalized_sample)
+
+        if len(valid_samples) == 0:
+            return None
+        if len(valid_samples) == 1:
+            return dict(valid_samples[0])
+
+        query_progress_m = float(query_progress_m)
+        first_progress_m = float(valid_samples[0]["progress_m"])
+        last_progress_m = float(valid_samples[-1]["progress_m"])
+        if query_progress_m <= first_progress_m:
+            return dict(valid_samples[0])
+        if query_progress_m >= last_progress_m:
+            return dict(valid_samples[-1])
+
+        for idx in range(len(valid_samples) - 1):
+            lower = valid_samples[idx]
+            upper = valid_samples[idx + 1]
+            lower_progress_m = float(lower["progress_m"])
+            upper_progress_m = float(upper["progress_m"])
+            if query_progress_m > upper_progress_m:
+                continue
+            span_m = upper_progress_m - lower_progress_m
+            if span_m <= 1e-9:
+                return dict(lower)
+            fraction = min(1.0, max(0.0, (query_progress_m - lower_progress_m) / span_m))
+            heading_rad = self._blend_heading_angles(
+                path_heading_rad=float(lower["heading_rad"]),
+                los_heading_rad=float(upper["heading_rad"]),
+                los_weight=float(fraction),
+            )
+            nearer = lower if fraction < 0.5 else upper
+            return {
+                "x_ref_m": float(lower["x_ref_m"]) + fraction * (float(upper["x_ref_m"]) - float(lower["x_ref_m"])),
+                "y_ref_m": float(lower["y_ref_m"]) + fraction * (float(upper["y_ref_m"]) - float(lower["y_ref_m"])),
+                "heading_rad": float(heading_rad),
+                "lane_id": int(nearer["lane_id"]),
+                "lane_width_m": float(nearer["lane_width_m"]),
+                "road_center_offset_m": float(nearer["road_center_offset_m"]),
+                "road_left_width_m": float(nearer["road_left_width_m"]),
+                "road_right_width_m": float(nearer["road_right_width_m"]),
+                "progress_m": float(query_progress_m),
+            }
+
+        return dict(valid_samples[-1])
+
+    def _get_lane_center_stage_ref_by_progress(
+        self,
+        lane_center_reference: Sequence[Mapping[str, object]] | None,
+        query_progress_m: float,
+    ) -> Tuple[float, float, float] | None:
+        """Tuple view of _get_lane_center_stage_sample_by_progress, mirroring
+        _get_lane_center_stage_ref's relationship to
+        _get_lane_center_stage_sample."""
+
+        sample = self._get_lane_center_stage_sample_by_progress(
+            lane_center_reference=lane_center_reference,
+            query_progress_m=float(query_progress_m),
         )
         if sample is None:
             return None
@@ -900,7 +1238,7 @@ class MPC:
         destination_state: np.ndarray,
         route_reference_points: Sequence[Sequence[float]] | None,
         destination_lane_id: int | None = None,
-    ) -> List[Dict[str, float]]:
+    ) -> List[Dict[str, object]]:
         if route_reference_points is None or len(route_reference_points) < 2:
             return []
 
@@ -932,6 +1270,7 @@ class MPC:
                     "road_center_offset_m": 0.0,
                     "road_left_width_m": 0.5 * float(self.lane_width_m),
                     "road_right_width_m": 0.5 * float(self.lane_width_m),
+                    "progress_m": float(progress_m),
                 }
             )
         return stage_reference
@@ -1053,6 +1392,7 @@ class MPC:
 
         stage_reference: List[Dict[str, float]] = []
         visited_keys: set[Tuple[float, float]] = set()
+        cumulative_progress_m = 0.0
         for _k in range(self.horizon_steps + 1):
             current_position = self._lane_center_waypoint_position(current_waypoint)
             if current_position is None:
@@ -1070,6 +1410,7 @@ class MPC:
                     "road_center_offset_m": float(current_waypoint.get("road_center_offset_m", 0.0)),
                     "road_left_width_m": float(current_waypoint.get("road_left_width_m", 0.5 * lane_width_m)),
                     "road_right_width_m": float(current_waypoint.get("road_right_width_m", 0.5 * lane_width_m)),
+                    "progress_m": float(cumulative_progress_m),
                 }
             )
 
@@ -1090,12 +1431,21 @@ class MPC:
             next_waypoint = waypoint_by_xy.get(next_key)
             if next_waypoint is None:
                 break
+            cumulative_progress_m += math.hypot(
+                float(next_position_raw[0]) - float(current_position[0]),
+                float(next_position_raw[1]) - float(current_position[1]),
+            )
             current_waypoint = next_waypoint
 
         if len(stage_reference) == 0:
             return []
         while len(stage_reference) < self.horizon_steps + 1:
-            stage_reference.append(dict(stage_reference[-1]))
+            held_sample = dict(stage_reference[-1])
+            # Keep tagging progress_m even for the held/duplicated tail
+            # samples (destination reached before the horizon fills), so
+            # progress-based lookups downstream still see a monotonically
+            # valid (if flat) progress value instead of an implicit repeat.
+            stage_reference.append(held_sample)
         return stage_reference
 
     def _normalize_lane_center_reference_samples(
@@ -1147,6 +1497,73 @@ class MPC:
             float(v),
             float(psi),
         ]
+
+    @staticmethod
+    def _translate_object_snapshots(
+        object_snapshots: Sequence[Mapping[str, object]],
+        *,
+        origin_x_m: float,
+        origin_y_m: float,
+    ) -> List[Dict[str, object]]:
+        """Translate obstacle states into the ego-origin QP frame."""
+
+        translated: List[Dict[str, object]] = []
+        for raw_snapshot in list(object_snapshots or []):
+            if not isinstance(raw_snapshot, Mapping):
+                continue
+            snapshot: Dict[str, object] = dict(raw_snapshot)
+            try:
+                snapshot["x"] = float(snapshot.get("x", 0.0)) - float(origin_x_m)
+                snapshot["y"] = float(snapshot.get("y", 0.0)) - float(origin_y_m)
+            except (TypeError, ValueError):
+                continue
+            for trajectory_key in ("predicted_trajectory", "future_trajectory"):
+                raw_trajectory = snapshot.get(trajectory_key)
+                if not isinstance(raw_trajectory, Sequence):
+                    continue
+                local_trajectory: List[object] = []
+                for raw_state in raw_trajectory:
+                    if isinstance(raw_state, Mapping):
+                        state = dict(raw_state)
+                        if "x" in state and "y" in state:
+                            state["x"] = float(state["x"]) - float(origin_x_m)
+                            state["y"] = float(state["y"]) - float(origin_y_m)
+                        local_trajectory.append(state)
+                    elif isinstance(raw_state, Sequence) and len(raw_state) >= 2:
+                        state = list(raw_state)
+                        state[0] = float(state[0]) - float(origin_x_m)
+                        state[1] = float(state[1]) - float(origin_y_m)
+                        local_trajectory.append(state)
+                    else:
+                        local_trajectory.append(raw_state)
+                snapshot[trajectory_key] = local_trajectory
+            translated.append(snapshot)
+        return translated
+
+    @staticmethod
+    def _translate_lane_reference(
+        lane_center_reference: Sequence[Mapping[str, object]],
+        *,
+        origin_x_m: float,
+        origin_y_m: float,
+    ) -> List[Dict[str, float]]:
+        """Translate lane samples while preserving all geometric metadata."""
+
+        translated: List[Dict[str, object]] = []
+        for raw_sample in list(lane_center_reference or []):
+            sample = dict(raw_sample)
+            sample["x_ref_m"] = float(sample.get("x_ref_m", 0.0)) - float(
+                origin_x_m
+            )
+            sample["y_ref_m"] = float(sample.get("y_ref_m", 0.0)) - float(
+                origin_y_m
+            )
+            if "x" in sample:
+                sample["x"] = float(sample["x"]) - float(origin_x_m)
+            if "y" in sample:
+                sample["y"] = float(sample["y"]) - float(origin_y_m)
+            translated.append(sample)
+        return translated
 
     def _build_shifted_previous_solution_seed(self, x0: np.ndarray) -> Tuple[np.ndarray, np.ndarray] | None:
         """
@@ -1279,6 +1696,27 @@ class MPC:
         )
         return float(min(base_speed_mps, stop_speed_limit_mps))
 
+    @staticmethod
+    def _cross_track_lateral_scale(
+        *,
+        cross_track_abs_m: float,
+        full_suppression_m: float,
+        full_response_m: float,
+    ) -> float:
+        """Smooth ramp: 0 at/below full_suppression_m (obstacle basically
+        straight ahead -- suppress the lateral pull entirely), 1 at/above
+        full_response_m (obstacle clearly off to the side -- leave the
+        lateral pull untouched), linear in between."""
+
+        offset_m = abs(float(cross_track_abs_m))
+        low_m = max(0.0, float(full_suppression_m))
+        high_m = max(low_m + 1.0e-6, float(full_response_m))
+        if offset_m <= low_m:
+            return 0.0
+        if offset_m >= high_m:
+            return 1.0
+        return float((offset_m - low_m) / (high_m - low_m))
+
     def _superellipsoid_obstacle_cost_components(
         self,
         ego_state: Sequence[float],
@@ -1369,6 +1807,29 @@ class MPC:
             "rs": float(rc),
         }
 
+    def _log_barrier_obstacle_cost_component(self, rc: float) -> float:
+        """Softplus envelope-containment cost (per Yu et al., "Spatial
+        Envelope MPC: High Performance Driving without a Reference",
+        arXiv:2509.18506), adapted to this module's existing rc/s_c
+        collision-zone geometry:
+
+            m = rc - s_c                          (margin beyond the zone surface)
+            J = w_log * log(1 + exp(-theta * m))   (smooth hinge, ~0 for m >> 0)
+
+        Unlike a `-log(margin)` interior-point barrier, this is defined and
+        finite for every real m (no domain restriction, no log(0)/NaN risk),
+        which matters here because _superellipsoid_cost_taylor_terms probes
+        this function at finite perturbed states in both directions to form
+        a central-difference gradient/Hessian.
+        """
+
+        margin = float(rc) - float(self.repulsive_cost.collision_distance_shift)
+        theta = float(self.repulsive_cost.log_barrier_gain)
+        # np.logaddexp(0, x) == log(1 + exp(x)), computed in a numerically
+        # stable way (no overflow for large |x|).
+        softplus = float(np.logaddexp(0.0, -theta * margin))
+        return float(self.repulsive_cost.w_log_barrier) * softplus
+
     def _superellipsoid_obstacle_cost(
         self,
         ego_state: Sequence[float],
@@ -1376,13 +1837,26 @@ class MPC:
         obstacle_length_m: float,
         obstacle_width_m: float,
     ) -> float:
+        geometry = self._superellipsoid_zone_geometry(
+            ego_state=ego_state,
+            obstacle_state=obstacle_state,
+            obstacle_length_m=obstacle_length_m,
+            obstacle_width_m=obstacle_width_m,
+        )
         cost_safe, cost_collision = self._superellipsoid_obstacle_cost_components(
             ego_state=ego_state,
             obstacle_state=obstacle_state,
             obstacle_length_m=obstacle_length_m,
             obstacle_width_m=obstacle_width_m,
         )
-        return float(cost_safe + cost_collision)
+        if bool(self.repulsive_cost.log_barrier_replace_exponential):
+            cost_collision = 0.0
+        cost_log_barrier = (
+            self._log_barrier_obstacle_cost_component(float(geometry["rc"]))
+            if bool(self.repulsive_cost.log_barrier_enabled)
+            else 0.0
+        )
+        return float(cost_safe + cost_collision + cost_log_barrier)
 
     def _superellipsoid_cost_taylor_terms(
         self,
@@ -1605,23 +2079,28 @@ class MPC:
         """
 
         base_max_velocity_mps = float(self.constraints.max_velocity_mps)
-        if not bool(self.final_stop_speed_cap_enabled):
-            return float(base_max_velocity_mps)
-        if len(destination_state) < 2:
-            return float(base_max_velocity_mps)
-
         destination_speed_mps = (
             abs(float(destination_state[2]))
             if len(destination_state) >= 3
             else 0.0
         )
-        if (
-            not bool(force_stop_goal)
-            and (
-                len(destination_state) < 3
-                or destination_speed_mps > float(self.final_stop_speed_cap_activation_threshold_mps)
-            )
-        ):
+        if not bool(force_stop_goal):
+            if len(destination_state) < 3:
+                return float(base_max_velocity_mps)
+            if destination_speed_mps > float(
+                self.final_stop_speed_cap_activation_threshold_mps
+            ):
+                return float(min(
+                    base_max_velocity_mps,
+                    max(
+                        float(self.constraints.min_velocity_mps),
+                        float(destination_speed_mps)
+                        + float(self.reference_speed_upper_bound_margin_mps),
+                    ),
+                ))
+        if not bool(self.final_stop_speed_cap_enabled):
+            return float(base_max_velocity_mps)
+        if len(destination_state) < 2:
             return float(base_max_velocity_mps)
 
         current_x_m = float(current_state[0]) if len(current_state) >= 1 else 0.0
@@ -1720,12 +2199,28 @@ class MPC:
                 float(self.constraints.min_acceleration_mps2),
                 float(self.constraints.max_acceleration_mps2),
             )
-        print(
-            "[MPC] "
-            + ("EMERGENCY STOP" if emergency else "brake-gently")
-            + " fail-safe fallback trajectory "
-            + f"(consecutive_failures={int(self._consecutive_solver_failure_count)})"
+        event_count = int(getattr(self, "_solver_failure_log_event_count", 0)) + 1
+        self._solver_failure_log_event_count = int(event_count)
+        emergency_first_report = bool(
+            emergency
+            and not bool(
+                getattr(self, "_solver_failure_emergency_logged", False)
+            )
         )
+        log_every_n = max(
+            1,
+            int(getattr(self, "solver_failure_log_every_n", 50)),
+        )
+        if event_count == 1 or emergency_first_report or event_count % log_every_n == 0:
+            print(
+                "[MPC] "
+                + ("EMERGENCY STOP" if emergency else "brake-gently")
+                + " fail-safe fallback trajectory "
+                + f"(consecutive_failures={int(self._consecutive_solver_failure_count)}, "
+                + f"fallback_events={int(event_count)})"
+            )
+        if emergency:
+            self._solver_failure_emergency_logged = True
         return x_solution, u_solution
 
     def _future_speed_upper_bound_mps(
@@ -1826,16 +2321,20 @@ class MPC:
             x_seed = np.asarray(seed_state_traj, dtype=float).copy()
             u_seed = np.asarray(seed_control_traj, dtype=float).copy()
             x_seed[0] = np.asarray(x0, dtype=float)
+            seed_speed_soft_active = bool(getattr(self, "speed_soft_constraint_enabled", False))
             for k in range(1, self.horizon_steps + 1):
                 stage_speed_upper_bound_mps = self._future_speed_upper_bound_mps(
                     active_speed_upper_bound_mps=float(effective_speed_upper_bound_mps),
                     future_state_index=int(k),
                     reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
                 )
+                seed_clamp_upper_mps = float(stage_speed_upper_bound_mps)
+                if seed_speed_soft_active:
+                    seed_clamp_upper_mps += float(self.speed_soft_max_slack_mps)
                 x_seed[k, 2] = self._clamp(
                     float(x_seed[k, 2]),
                     float(self.constraints.min_velocity_mps),
-                    float(stage_speed_upper_bound_mps),
+                    seed_clamp_upper_mps,
                 )
             x_seed[:, 3] = np.asarray([self._wrap_angle(float(angle)) for angle in x_seed[:, 3]], dtype=float)
             return x_seed, u_seed
@@ -1848,21 +2347,54 @@ class MPC:
         v_goal = self._clamp(v_goal, self.constraints.min_velocity_mps, effective_speed_upper_bound_mps)
         psi_goal = self._wrap_angle(psi_goal)
 
+        progress_lookup_active = bool(
+            getattr(self, "lane_center_follow_use_progress_lookup", False)
+        ) and bool(self.reference_prefer_lane_center_path) and bool(lane_center_reference)
+        current_progress_m = 0.0
+        if progress_lookup_active:
+            current_progress_m, _ = self._nearest_progress_along_route(
+                route_points=[
+                    (float(s.get("x_ref_m", 0.0)), float(s.get("y_ref_m", 0.0)))
+                    for s in lane_center_reference
+                    if isinstance(s, Mapping)
+                ],
+                xy=[float(x0[0]), float(x0[1])],
+            )
+
         for k in range(self.horizon_steps):
             x_m, y_m, v_mps, psi_rad = [float(v) for v in x_ref_traj[k]]
             target_x_m = float(x_goal)
             target_y_m = float(y_goal)
             path_heading_rad = float(psi_goal)
 
-            if bool(self.reference_prefer_lane_center_path):
+            if progress_lookup_active:
+                # Query the position this stage's own traveled arc length so
+                # far implies for the *next* stage, rather than indexing the
+                # reference array by stage number k+1 -- the two only agree
+                # on a straight reference built at exactly the nominal step
+                # distance; on a curve, array position and true along-path
+                # distance diverge.
+                next_progress_estimate_m = float(current_progress_m) + max(0.5, float(v_mps) * float(self.dt_s))
+                stage_ref = self._get_lane_center_stage_ref_by_progress(
+                    lane_center_reference=lane_center_reference,
+                    query_progress_m=next_progress_estimate_m,
+                )
+                if stage_ref is None:
+                    stage_ref = self._get_lane_center_stage_ref(
+                        lane_center_reference=lane_center_reference,
+                        stage_index=int(k + 1),
+                    )
+            elif bool(self.reference_prefer_lane_center_path):
                 stage_ref = self._get_lane_center_stage_ref(
                     lane_center_reference=lane_center_reference,
                     stage_index=int(k + 1),
                 )
-                if stage_ref is not None:
-                    target_x_m = float(stage_ref[0])
-                    target_y_m = float(stage_ref[1])
-                    path_heading_rad = float(stage_ref[2])
+            else:
+                stage_ref = None
+            if stage_ref is not None:
+                target_x_m = float(stage_ref[0])
+                target_y_m = float(stage_ref[1])
+                path_heading_rad = float(stage_ref[2])
 
             dx_target = target_x_m - x_m
             dy_target = target_y_m - y_m
@@ -1905,6 +2437,14 @@ class MPC:
                 future_state_index=int(k + 1),
                 reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
             )
+            if bool(getattr(self, "speed_soft_constraint_enabled", False)):
+                # Keep the rollout's own linearization reference consistent
+                # with what _build_qp now permits the solved trajectory to
+                # reach, so the QP doesn't linearize around an artificially
+                # conservative point.
+                next_stage_speed_upper_bound_mps = float(
+                    next_stage_speed_upper_bound_mps
+                ) + float(self.speed_soft_max_slack_mps)
             stage_speed_target_mps = min(float(stage_speed_target_mps), float(next_stage_speed_upper_bound_mps))
             accel_des = self.reference_speed_gain * (stage_speed_target_mps - v_mps)
             accel_des = self._clamp(
@@ -1925,6 +2465,8 @@ class MPC:
             )
             psi_next = self._wrap_angle(psi_rad + self.dt_s * (v_mps / self.l_r_m) * math.sin(beta_rad))
             x_ref_traj[k + 1] = np.array([x_next, y_next, v_next, psi_next], dtype=float)
+            if progress_lookup_active:
+                current_progress_m += math.hypot(float(x_next) - x_m, float(y_next) - y_m)
 
         return x_ref_traj, u_ref_traj
 
@@ -1994,6 +2536,7 @@ class MPC:
         lane_center_reference: Sequence[Mapping[str, object]] | None,
         speed_upper_bound_mps: float | None,
         reachable_speed_floor_profile_mps: Sequence[float] | None,
+        road_envelope_blocks: Mapping[str, object] | None = None,
     ) -> Tuple[sp.csc_matrix, np.ndarray, sp.csc_matrix, np.ndarray, np.ndarray, QPIndex]:
         """
         Intent:
@@ -2005,16 +2548,32 @@ class MPC:
         """
 
         object_count = len(object_snapshots)
+        envelope_blocks_list = (
+            list(road_envelope_blocks.get("blocks", []) or [])
+            if isinstance(road_envelope_blocks, Mapping)
+            else []
+        )
+        road_envelope_term_active = (
+            bool(getattr(self, "road_envelope_enabled", False))
+            and float(getattr(self, "road_envelope_weight", 0.0)) > 0.0
+            and len(envelope_blocks_list) > 0
+        )
         road_boundary_term_active = (
             bool(getattr(self, "road_boundary_enabled", True))
             and float(getattr(self, "road_boundary_weight", self.lane_keep_boundary_weight)) > 0.0
+            and not road_envelope_term_active
         )
+        speed_soft_term_active = bool(getattr(self, "speed_soft_constraint_enabled", False))
         index = QPIndex(
             nx=self.nx,
             nu=self.nu,
             horizon_steps=self.horizon_steps,
             road_boundary_slack_pair_count=(
                 int(self.horizon_steps) if road_boundary_term_active else 0
+            ),
+            speed_slack_count=(int(self.horizon_steps) if speed_soft_term_active else 0),
+            road_envelope_slack_count=(
+                int(self.horizon_steps) if road_envelope_term_active else 0
             ),
         )
         n_var = index.total_variables
@@ -2062,15 +2621,10 @@ class MPC:
             lower_bounds.append(float(lower))
             upper_bounds.append(float(upper))
 
-        # Reference state is the destination state.
-        # The image shows the state-tracking sum from k=0..N. Here the k=0 term
-        # is omitted from optimization assembly because X_0 is fixed by an
-        # equality constraint, so that term is a constant offset and does not
-        # change the optimizer solution.
-        x_ref_value = float(x_ref_target[0])
-        y_ref_value = float(x_ref_target[1])
-        v_ref_value = float(x_ref_target[2])
-        psi_ref_value = float(x_ref_target[3])
+        # X_0 is fixed, so tracking starts at stage 1. Each predicted state must
+        # track its matching time-parameterized rollout sample. Applying the
+        # terminal destination to every stage creates a receding-horizon
+        # accelerate/brake limit cycle as the endpoint moves forward each tick.
 
         # --- Objective: control term Cost_Control ---
         # Penalizes rapid changes in acceleration and steering across horizon.
@@ -2110,7 +2664,38 @@ class MPC:
         w_qy_safe = attractive_scale * float(self.comfort_cost.qy)
         w_qv_safe = attractive_scale * float(self.comfort_cost.qv)
         w_qpsi_safe = attractive_scale * float(self.comfort_cost.qpsi)
+
+        qp_progress_lookup_active = bool(
+            getattr(self, "lane_center_follow_use_progress_lookup", False)
+        ) and bool(lane_center_reference)
+        qp_stage_progress_m: List[float] = []
+        if qp_progress_lookup_active:
+            ego_progress_m, _ = self._nearest_progress_along_route(
+                route_points=[
+                    (float(s.get("x_ref_m", 0.0)), float(s.get("y_ref_m", 0.0)))
+                    for s in lane_center_reference
+                    if isinstance(s, Mapping)
+                ],
+                xy=[float(x0[0]), float(x0[1])],
+            )
+            cumulative_distance_m = 0.0
+            qp_stage_progress_m = [float(ego_progress_m)]
+            for j in range(self.horizon_steps):
+                cumulative_distance_m += math.hypot(
+                    float(x_ref_rollout[j + 1, 0]) - float(x_ref_rollout[j, 0]),
+                    float(x_ref_rollout[j + 1, 1]) - float(x_ref_rollout[j, 1]),
+                )
+                qp_stage_progress_m.append(float(ego_progress_m) + float(cumulative_distance_m))
+
         for k in range(1, self.horizon_steps + 1):
+            stage_reference = self._tracking_reference_at_stage(
+                x_ref_rollout=x_ref_rollout,
+                stage_index=int(k),
+            )
+            x_ref_value = float(stage_reference[0])
+            y_ref_value = float(stage_reference[1])
+            v_ref_value = float(stage_reference[2])
+            psi_ref_value = self._wrap_angle(float(stage_reference[3]))
             x_k_idx = index.state_index(k, 0)
             y_k_idx = index.state_index(k, 1)
             add_tracking(x_k_idx, w_qx_safe, x_ref_value)
@@ -2123,12 +2708,19 @@ class MPC:
             # where
             #   e_y   = -(x-x_ref)sin(theta_ref) + (y-y_ref)cos(theta_ref)
             #   e_psi = wrap(psi - theta_ref)
-            lane_sample = self._get_lane_center_stage_sample(
-                lane_center_reference=lane_center_reference,
-                stage_index=int(k),
-                query_x_m=float(x_ref_rollout[k, 0]),
-                query_y_m=float(x_ref_rollout[k, 1]),
-            )
+            lane_sample = None
+            if qp_progress_lookup_active:
+                lane_sample = self._get_lane_center_stage_sample_by_progress(
+                    lane_center_reference=lane_center_reference,
+                    query_progress_m=qp_stage_progress_m[k],
+                )
+            if lane_sample is None:
+                lane_sample = self._get_lane_center_stage_sample(
+                    lane_center_reference=lane_center_reference,
+                    stage_index=int(k),
+                    query_x_m=float(x_ref_rollout[k, 0]),
+                    query_y_m=float(x_ref_rollout[k, 1]),
+                )
             lane_reference = normalize_lane_reference_sample(
                 lane_sample,
                 default_lane_width_m=float(getattr(self, "lane_width_m", 4.0)),
@@ -2136,8 +2728,27 @@ class MPC:
             if lane_reference is not None:
                 centerline_xy_weight = float(getattr(self, "lane_center_follow_xy_weight", 0.0))
                 if bool(self.lane_center_follow_enabled) and float(centerline_xy_weight) > 0.0:
-                    add_tracking(x_k_idx, centerline_xy_weight, float(lane_reference.x_center_m))
-                    add_tracking(y_k_idx, centerline_xy_weight, float(lane_reference.y_center_m))
+                    if bool(getattr(self, "lane_center_follow_xy_uses_frenet_decomposition", False)):
+                        # Decomposed form: penalize along-track deviation
+                        # from the reference point in the lane frame instead
+                        # of pulling raw world x and y toward
+                        # (x_center_m, y_center_m) independently -- both are
+                        # zero exactly at the reference point, but this form
+                        # doesn't couple world-frame x/y errors together and
+                        # rotates with lane heading the way the lateral term
+                        # below already does.
+                        long_affine = signed_longitudinal_progress_affine_form(lane_reference)
+                        p_coef = float(long_affine.x_coef)
+                        q_coef = float(long_affine.y_coef)
+                        r_coef = float(long_affine.constant)
+                        add_quadratic(x_k_idx, centerline_xy_weight * p_coef * p_coef)
+                        add_quadratic(y_k_idx, centerline_xy_weight * q_coef * q_coef)
+                        add_p_entry(x_k_idx, y_k_idx, 2.0 * centerline_xy_weight * p_coef * q_coef)
+                        q[x_k_idx] += 2.0 * centerline_xy_weight * p_coef * r_coef
+                        q[y_k_idx] += 2.0 * centerline_xy_weight * q_coef * r_coef
+                    else:
+                        add_tracking(x_k_idx, centerline_xy_weight, float(lane_reference.x_center_m))
+                        add_tracking(y_k_idx, centerline_xy_weight, float(lane_reference.y_center_m))
 
                 lane_affine = signed_lateral_offset_affine_form(lane_reference)
                 a_coef = float(lane_affine.x_coef)
@@ -2198,6 +2809,60 @@ class MPC:
                     add_constraint({left_slack_idx: 1.0}, 0.0, road_slack_upper)
                     add_constraint({right_slack_idx: 1.0}, 0.0, road_slack_upper)
 
+                if road_envelope_term_active:
+                    # Road-envelope block-union hard constraint (Yu et al.,
+                    # arXiv:2509.18506, Sec. III-B1), gated in mutually
+                    # exclusive to road_boundary_term_active above. Unlike
+                    # the line-based road_boundary constraint (tied to
+                    # whichever lane_reference sample is active this tick,
+                    # which can jump when the tracked reference switches
+                    # lanes mid-maneuver), this constraint is linearized
+                    # around the current rollout point against a UNION of
+                    # static blocks that never move for the duration of the
+                    # locked maneuver -- so it stays satisfiable even when
+                    # the reference itself jumps.
+                    stage_x0_m = float(x_ref_rollout[k, 0])
+                    stage_y0_m = float(x_ref_rollout[k, 1])
+                    envelope_rho = float(
+                        road_envelope_blocks.get(
+                            "rho", getattr(self, "road_envelope_rho", -8.0)
+                        )
+                    )
+                    envelope_epsilon0 = float(road_envelope_blocks.get("epsilon0", 0.0))
+                    g_lse0, dg_dx, dg_dy, _weights = road_envelope_union_logsumexp(
+                        blocks=envelope_blocks_list,
+                        rho=envelope_rho,
+                        x_m=stage_x0_m,
+                        y_m=stage_y0_m,
+                    )
+                    h0 = float(g_lse0) - float(envelope_epsilon0)
+                    envelope_slack_idx = index.road_envelope_slack_index(k)
+                    envelope_weight = float(
+                        getattr(self, "road_envelope_weight", 0.0)
+                    )
+                    add_quadratic(envelope_slack_idx, envelope_weight)
+                    add_constraint(
+                        {
+                            x_k_idx: float(dg_dx),
+                            y_k_idx: float(dg_dy),
+                            envelope_slack_idx: -1.0,
+                        },
+                        -np.inf,
+                        float(dg_dx * stage_x0_m + dg_dy * stage_y0_m - h0),
+                    )
+                    envelope_max_slack_m = float(
+                        getattr(self, "road_envelope_max_slack_m", np.inf)
+                    )
+                    envelope_slack_upper = (
+                        float(envelope_max_slack_m)
+                        if math.isfinite(float(envelope_max_slack_m))
+                        and float(envelope_max_slack_m) > 0.0
+                        else np.inf
+                    )
+                    add_constraint(
+                        {envelope_slack_idx: 1.0}, 0.0, envelope_slack_upper
+                    )
+
         # --- Objective: repulsive potential field Cost_Repulsive ---
         # Super-ellipsoid obstacle cost from `super_ellipsoid.py`, approximated
         # by a local quadratic Taylor model in [x, y, v, psi] for each stage.
@@ -2243,6 +2908,41 @@ class MPC:
                     gradient = float(repulsive_weight) * np.asarray(gradient, dtype=float)
                     hessian = float(repulsive_weight) * np.asarray(hessian, dtype=float)
 
+                    if bool(self.repulsive_cost.cross_track_suppression_enabled):
+                        stage_heading_rad = float(ego_state_ref[3])
+                        cos_h = math.cos(stage_heading_rad)
+                        sin_h = math.sin(stage_heading_rad)
+                        cross_track_m = (
+                            -(float(obj_state[0]) - float(ego_state_ref[0])) * sin_h
+                            + (float(obj_state[1]) - float(ego_state_ref[1])) * cos_h
+                        )
+                        lateral_scale = self._cross_track_lateral_scale(
+                            cross_track_abs_m=abs(cross_track_m),
+                            full_suppression_m=float(
+                                self.repulsive_cost.cross_track_full_suppression_m
+                            ),
+                            full_response_m=float(
+                                self.repulsive_cost.cross_track_full_response_m
+                            ),
+                        )
+                        if lateral_scale < 1.0:
+                            # R is orthogonal (rotation by the stage heading),
+                            # so rotating into (along, cross), scaling only
+                            # what touches cross-track, and rotating back is
+                            # an exact change of basis -- the along-track
+                            # (braking) contribution is left untouched.
+                            rotation = np.array(
+                                [[cos_h, sin_h], [-sin_h, cos_h]], dtype=float
+                            )
+                            g_rot = rotation @ gradient[0:2]
+                            h_rot = rotation @ hessian[0:2, 0:2] @ rotation.T
+                            g_rot[1] *= lateral_scale
+                            h_rot[0, 1] *= lateral_scale
+                            h_rot[1, 0] *= lateral_scale
+                            h_rot[1, 1] *= lateral_scale
+                            gradient[0:2] = rotation.T @ g_rot
+                            hessian[0:2, 0:2] = rotation.T @ h_rot @ rotation
+
                     if bool(self.repulsive_cost.project_hessian_psd):
                         hessian = self._project_symmetric_hessian_to_psd(hessian=hessian)
 
@@ -2267,6 +2967,12 @@ class MPC:
             for k in range(1, self.horizon_steps + 1):
                 add_quadratic(index.road_boundary_left_slack_index(k), tiny_reg)
                 add_quadratic(index.road_boundary_right_slack_index(k), tiny_reg)
+        if speed_soft_term_active:
+            for k in range(1, self.horizon_steps + 1):
+                add_quadratic(index.speed_slack_index(k), tiny_reg)
+        if road_envelope_term_active:
+            for k in range(1, self.horizon_steps + 1):
+                add_quadratic(index.road_envelope_slack_index(k), tiny_reg)
 
         # --- Constraints ---
         # Initial state equality X_0 = current state.
@@ -2284,18 +2990,43 @@ class MPC:
                     coeffs[index.control_index(k, j)] = coeffs.get(index.control_index(k, j), 0.0) - float(B_k[i, j])
                 add_constraint(coeffs, float(c_k[i]), float(c_k[i]))
 
-        # Speed constraints for future states.
+        # Speed constraints for future states. The lower bound (near-zero
+        # floor) always stays hard. The upper bound (the "speed profile
+        # limit cap", e.g. curve/traffic-light/lead-obstacle speed caps) is
+        # hard by default, matching prior behavior exactly. When
+        # speed_soft_term_active, it becomes a slack-penalized soft bound
+        # instead -- mirrors the road-boundary slack pattern above: v_k is
+        # allowed to exceed the posted cap only by paying a quadratic
+        # penalty per unit overshoot, itself hard-capped at
+        # speed_soft_max_slack_mps so the softened bound still cannot be
+        # violated without limit.
         for k in range(1, self.horizon_steps + 1):
             stage_speed_upper_bound_mps = self._future_speed_upper_bound_mps(
                 active_speed_upper_bound_mps=float(effective_speed_upper_bound_mps),
                 future_state_index=int(k),
                 reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
             )
-            add_constraint(
-                {index.state_index(k, 2): 1.0},
-                self.constraints.min_velocity_mps,
-                float(stage_speed_upper_bound_mps),
-            )
+            v_idx = index.state_index(k, 2)
+            if speed_soft_term_active:
+                add_constraint({v_idx: 1.0}, self.constraints.min_velocity_mps, np.inf)
+                slack_idx = index.speed_slack_index(k)
+                add_quadratic(slack_idx, float(self.speed_soft_constraint_weight))
+                add_constraint(
+                    {v_idx: 1.0, slack_idx: -1.0},
+                    -np.inf,
+                    float(stage_speed_upper_bound_mps),
+                )
+                add_constraint(
+                    {slack_idx: 1.0},
+                    0.0,
+                    float(self.speed_soft_max_slack_mps),
+                )
+            else:
+                add_constraint(
+                    {v_idx: 1.0},
+                    self.constraints.min_velocity_mps,
+                    float(stage_speed_upper_bound_mps),
+                )
         # Optional hard terminal-speed constraint. Apply it only for stop-like
         # destinations (destination speed near zero), otherwise every rolling
         # temporary goal would incorrectly force the horizon-end speed to zero.
@@ -2370,6 +3101,20 @@ class MPC:
         l = np.asarray(lower_bounds, dtype=float)
         u = np.asarray(upper_bounds, dtype=float)
         return P, q, A, l, u, index
+
+    @staticmethod
+    def _tracking_reference_at_stage(
+        *,
+        x_ref_rollout: np.ndarray,
+        stage_index: int,
+    ) -> np.ndarray:
+        """Return the time-matched state reference for one MPC stage."""
+
+        rollout = np.asarray(x_ref_rollout, dtype=float)
+        if rollout.ndim != 2 or rollout.shape[0] == 0 or rollout.shape[1] < 4:
+            raise ValueError("MPC tracking rollout must contain Nx4 states")
+        index = max(0, min(int(stage_index), int(rollout.shape[0]) - 1))
+        return np.asarray(rollout[index, :4], dtype=float)
 
     def _solve_qp(
         self,
@@ -2523,12 +3268,20 @@ class MPC:
                 and bool(self.lane_center_follow_enabled)
                 and float(centerline_xy_weight) > 0.0
             ):
-                dx_center = float(x_traj[int(metric.stage_index), 0]) - float(lane_reference.x_center_m)
-                dy_center = float(x_traj[int(metric.stage_index), 1]) - float(lane_reference.y_center_m)
-                cost_centerline_xy += float(centerline_xy_weight) * (
-                    float(dx_center) * float(dx_center)
-                    + float(dy_center) * float(dy_center)
-                )
+                if bool(getattr(self, "lane_center_follow_xy_uses_frenet_decomposition", False)):
+                    long_affine = signed_longitudinal_progress_affine_form(lane_reference)
+                    longitudinal_error = long_affine.evaluate(
+                        x_m=float(x_traj[int(metric.stage_index), 0]),
+                        y_m=float(x_traj[int(metric.stage_index), 1]),
+                    )
+                    cost_centerline_xy += float(centerline_xy_weight) * float(longitudinal_error) * float(longitudinal_error)
+                else:
+                    dx_center = float(x_traj[int(metric.stage_index), 0]) - float(lane_reference.x_center_m)
+                    dy_center = float(x_traj[int(metric.stage_index), 1]) - float(lane_reference.y_center_m)
+                    cost_centerline_xy += float(centerline_xy_weight) * (
+                        float(dx_center) * float(dx_center)
+                        + float(dy_center) * float(dy_center)
+                    )
             cost_lane_center += float(metric.centering_cost)
             cost_road_boundary += float(metric.boundary_cost)
             if bool(self.lane_center_follow_enabled) and float(self.lane_center_follow_weight) > 0.0:
@@ -2563,6 +3316,7 @@ class MPC:
 
         cost_repulsive_safe = 0.0
         cost_repulsive_collision = 0.0
+        cost_repulsive_logbarrier = 0.0
         if bool(self.repulsive_cost.enabled) and len(object_snapshots) > 0:
             for k in range(1, self.horizon_steps + 1):
                 stage_idx = k - 1
@@ -2591,9 +3345,36 @@ class MPC:
                         obstacle_length_m=obstacle_length_m,
                         obstacle_width_m=obstacle_width_m,
                     )
+                    if bool(self.repulsive_cost.log_barrier_replace_exponential):
+                        obstacle_cost_collision = 0.0
                     cost_repulsive_safe += float(repulsive_weight) * float(obstacle_cost_safe)
                     cost_repulsive_collision += float(repulsive_weight) * float(obstacle_cost_collision)
-        cost_repulsive = float(cost_repulsive_safe + cost_repulsive_collision)
+                    if bool(self.repulsive_cost.log_barrier_enabled):
+                        obstacle_geometry = self._superellipsoid_zone_geometry(
+                            ego_state=ego_state,
+                            obstacle_state=obj_state,
+                            obstacle_length_m=obstacle_length_m,
+                            obstacle_width_m=obstacle_width_m,
+                        )
+                        cost_repulsive_logbarrier += float(repulsive_weight) * float(
+                            self._log_barrier_obstacle_cost_component(float(obstacle_geometry["rc"]))
+                        )
+        cost_repulsive = float(cost_repulsive_safe + cost_repulsive_collision + cost_repulsive_logbarrier)
+
+        cost_velocity_slack = 0.0
+        if bool(getattr(self, "speed_soft_constraint_enabled", False)):
+            # Diagnostic-only approximation: measures overshoot beyond the
+            # global max_velocity_mps rather than re-deriving each stage's
+            # exact dynamic cap (curve/traffic-light/lead-obstacle caps),
+            # which would require threading extra parameters into this
+            # evaluation-only function. Sufficient for CSV visibility into
+            # whether/how much the soft constraint is engaging.
+            velocity_weight = float(self.speed_soft_constraint_weight)
+            max_velocity_mps = float(self.constraints.max_velocity_mps)
+            for k in range(1, self.horizon_steps + 1):
+                overshoot_mps = max(0.0, float(x_traj[k, 2]) - max_velocity_mps)
+                cost_velocity_slack += velocity_weight * overshoot_mps * overshoot_mps
+
         return {
             "Cost_ref": float(cost_attractive),
             "Cost_LaneCenter": float(cost_lane_center),
@@ -2603,8 +3384,10 @@ class MPC:
             "Cost_Lane": float(cost_lane_center + cost_centerline_xy + cost_road_boundary),
             "Cost_Repulsive_Safe": float(cost_repulsive_safe),
             "Cost_Repulsive_Collision": float(cost_repulsive_collision),
+            "Cost_Repulsive_LogBarrier": float(cost_repulsive_logbarrier),
             "Cost_Repulsive": float(cost_repulsive),
             "Cost_Control": float(cost_control),
+            "Cost_VelocitySlack": float(cost_velocity_slack),
         }
 
     def plan_trajectory(
@@ -2617,6 +3400,7 @@ class MPC:
         lane_center_waypoints: Sequence[Mapping[str, object]] | None = None,
         lane_center_reference_samples: Sequence[Mapping[str, object]] | None = None,
         stop_goal_active: bool = False,
+        road_envelope_payload_world: Mapping[str, object] | None = None,
     ) -> List[List[float]]:
         """
         Intent:
@@ -2626,17 +3410,30 @@ class MPC:
         if len(current_state) != 4:
             raise ValueError("current_state must be [x, y, v, psi].")
 
-        x0 = np.array(
+        origin_x_m = float(current_state[0])
+        origin_y_m = float(current_state[1])
+        x0_world = np.array(
             [
-                float(current_state[0]),
-                float(current_state[1]),
+                float(origin_x_m),
+                float(origin_y_m),
                 self._clamp(float(current_state[2]), self.constraints.min_velocity_mps, self.constraints.max_velocity_mps),
                 self._wrap_angle(float(current_state[3])),
             ],
             dtype=float,
         )
+        x0 = np.asarray(x0_world, dtype=float).copy()
+        x0[0] = 0.0
+        x0[1] = 0.0
         planning_current_acceleration_mps2 = float(current_acceleration_mps2)
-        destination = self._normalize_destination_state(destination_state)
+        destination_world = self._normalize_destination_state(destination_state)
+        destination = np.asarray(destination_world, dtype=float).copy()
+        destination[0] -= float(origin_x_m)
+        destination[1] -= float(origin_y_m)
+        object_snapshots = self._translate_object_snapshots(
+            object_snapshots=object_snapshots,
+            origin_x_m=float(origin_x_m),
+            origin_y_m=float(origin_y_m),
+        )
         destination_lane_id = (
             int(destination_state[4])
             if len(destination_state) >= 5
@@ -2700,16 +3497,49 @@ class MPC:
             or bool(self.reference_prefer_lane_center_path)
         )
         if should_use_lane_center_reference:
-            lane_center_reference = self._normalize_lane_center_reference_samples(
+            world_lane_center_reference = self._normalize_lane_center_reference_samples(
                 lane_center_reference_samples=lane_center_reference_samples,
             )
-            if len(lane_center_reference) == 0:
-                lane_center_reference = self._build_lane_center_reference(
-                    current_state=x0,
-                    destination_state=destination,
+            if len(world_lane_center_reference) == 0:
+                world_destination = np.asarray(destination, dtype=float).copy()
+                world_destination[0] += float(origin_x_m)
+                world_destination[1] += float(origin_y_m)
+                world_lane_center_reference = self._build_lane_center_reference(
+                    current_state=x0_world,
+                    destination_state=world_destination,
                     lane_center_waypoints=lane_center_waypoints,
                     destination_lane_id=destination_lane_id,
                 )
+            lane_center_reference = self._translate_lane_reference(
+                lane_center_reference=world_lane_center_reference,
+                origin_x_m=float(origin_x_m),
+                origin_y_m=float(origin_y_m),
+            )
+
+        road_envelope_blocks: Mapping[str, object] | None = None
+        if isinstance(road_envelope_payload_world, Mapping):
+            world_blocks = list(road_envelope_payload_world.get("blocks", []) or [])
+            if world_blocks:
+                translated_blocks = [
+                    RoadEnvelopeBlock(
+                        x_center_m=float(block.x_center_m) - float(origin_x_m),
+                        y_center_m=float(block.y_center_m) - float(origin_y_m),
+                        heading_rad=float(block.heading_rad),
+                        half_length_m=float(block.half_length_m),
+                        half_width_m=float(block.half_width_m),
+                        shape_exponent=float(block.shape_exponent),
+                    )
+                    for block in world_blocks
+                ]
+                road_envelope_blocks = {
+                    "blocks": translated_blocks,
+                    "epsilon0": float(road_envelope_payload_world.get("epsilon0", 0.0)),
+                    "rho": float(
+                        road_envelope_payload_world.get(
+                            "rho", getattr(self, "road_envelope_rho", -8.0)
+                        )
+                    ),
+                }
 
         # During stop-goal mode never reuse the previous QP solution as seed.
         # Previous plans produced under the old v_ref=0 regime may have been
@@ -2733,7 +3563,15 @@ class MPC:
                 self._previous_x_solution = None
                 self._previous_u_solution = None
         else:
-            shifted_seed = self._build_shifted_previous_solution_seed(x0=x0)
+            shifted_seed = self._build_shifted_previous_solution_seed(x0=x0_world)
+            if shifted_seed is not None:
+                shifted_seed_x = np.asarray(shifted_seed[0], dtype=float).copy()
+                shifted_seed_x[:, 0] -= float(origin_x_m)
+                shifted_seed_x[:, 1] -= float(origin_y_m)
+                shifted_seed = (
+                    shifted_seed_x,
+                    np.asarray(shifted_seed[1], dtype=float),
+                )
         x_ref_rollout, u_ref_rollout = self._reference_rollout(
             x0=x0,
             x_ref_target=destination,
@@ -2768,6 +3606,7 @@ class MPC:
                     lane_center_reference=lane_center_reference,
                     speed_upper_bound_mps=float(active_speed_upper_bound_mps),
                     reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
+                    road_envelope_blocks=road_envelope_blocks,
                 )
                 solution, status, solve_time_ms = self._solve_qp(P=P, q=q, A=A, l=l, u=u)
                 solve_time_total_ms += float(solve_time_ms)
@@ -2795,11 +3634,12 @@ class MPC:
         solved_initially = best_x_solution is not None and best_u_solution is not None
         if self._record_solver_failure_state(solved=bool(solved_initially)):
             self._clear_all_solution_memory()
-            print(
-                "[MPC] Solver failed "
-                f"{int(self.reference_consecutive_solver_failure_reset_threshold)} consecutive replans; "
-                "clearing stored solution and retrying with a fresh rollout."
-            )
+            if bool(getattr(self, "log_solution_memory_resets", False)):
+                print(
+                    "[MPC] Solver failed "
+                    f"{int(self.reference_consecutive_solver_failure_reset_threshold)} consecutive replans; "
+                    "clearing stored solution and retrying with a fresh rollout."
+                )
             clean_x_ref_rollout, clean_u_ref_rollout = self._reference_rollout(
                 x0=x0,
                 x_ref_target=destination,
@@ -2841,25 +3681,28 @@ class MPC:
             u_solution = np.asarray(best_u_solution, dtype=float)
         x_solution = np.asarray(x_solution, dtype=float)
         u_solution = np.asarray(u_solution, dtype=float)
+        speed_soft_active_for_clamp = bool(getattr(self, "speed_soft_constraint_enabled", False))
         for k in range(1, self.horizon_steps + 1):
             stage_speed_upper_bound_mps = self._future_speed_upper_bound_mps(
                 active_speed_upper_bound_mps=float(active_speed_upper_bound_mps),
                 future_state_index=int(k),
                 reachable_speed_floor_profile_mps=reachable_speed_floor_profile_mps,
             )
+            # When the velocity upper bound was solved as a soft (slack)
+            # constraint in _build_qp, a legitimately-solved overshoot must
+            # not be clamped straight back down to the nominal cap here --
+            # that would silently erase the whole point of softening it.
+            # Allow up to the same speed_soft_max_slack_mps margin the QP
+            # itself was allowed to use.
+            clamp_upper_mps = float(stage_speed_upper_bound_mps)
+            if speed_soft_active_for_clamp:
+                clamp_upper_mps += float(self.speed_soft_max_slack_mps)
             x_solution[k, 2] = self._clamp(
                 float(x_solution[k, 2]),
                 float(self.constraints.min_velocity_mps),
-                float(stage_speed_upper_bound_mps),
+                clamp_upper_mps,
             )
             x_solution[k, 3] = self._wrap_angle(float(x_solution[k, 3]))
-
-        self._last_x_solution = np.asarray(x_solution, dtype=float)
-        self._last_u_solution = np.asarray(u_solution, dtype=float)
-
-        if best_x_solution is not None and best_u_solution is not None:
-            self._previous_x_solution = np.asarray(x_solution, dtype=float)
-            self._previous_u_solution = np.asarray(u_solution, dtype=float)
 
         self._last_cost_terms = self._evaluate_plan_cost_terms(
             x_traj=x_solution,
@@ -2871,6 +3714,16 @@ class MPC:
             lane_center_reference=lane_center_reference,
         )
 
+        world_x_solution = np.asarray(x_solution, dtype=float).copy()
+        world_x_solution[:, 0] += float(origin_x_m)
+        world_x_solution[:, 1] += float(origin_y_m)
+        self._last_x_solution = np.asarray(world_x_solution, dtype=float)
+        self._last_u_solution = np.asarray(u_solution, dtype=float)
+
+        if best_x_solution is not None and best_u_solution is not None:
+            self._previous_x_solution = np.asarray(world_x_solution, dtype=float)
+            self._previous_u_solution = np.asarray(u_solution, dtype=float)
+
         # Record whether this call was a stop goal so the next call can detect
         # the stop→resume transition and avoid reusing the v=0 braking seed.
         self._last_was_stop_goal = bool(_is_stop_goal)
@@ -2879,10 +3732,88 @@ class MPC:
         for k in range(1, self.horizon_steps + 1):
             output.append(
                 [
-                    float(x_solution[k, 0]),
-                    float(x_solution[k, 1]),
+                    float(world_x_solution[k, 0]),
+                    float(world_x_solution[k, 1]),
                     float(x_solution[k, 2]),
                     float(self._wrap_angle(float(x_solution[k, 3]))),
                 ]
             )
         return output
+
+    def probe_trajectory_feasibility(
+        self,
+        *,
+        current_state: Sequence[float],
+        destination_state: Sequence[float],
+        object_snapshots: Sequence[Mapping[str, object]],
+        current_acceleration_mps2: float,
+        current_steering_rad: float,
+        lane_center_reference_samples: Sequence[Mapping[str, object]] | None,
+        stop_goal_active: bool = False,
+        road_envelope_payload_world: Mapping[str, object] | None = None,
+    ) -> Dict[str, object]:
+        """Solve a candidate without changing MPC warm-start/runtime state."""
+
+        mutable_fields = (
+            "_last_status",
+            "_last_solve_time_ms",
+            "_last_active_max_velocity_mps",
+            "_last_cost_terms",
+            "_last_lane_keeping_profile",
+            "_last_x_solution",
+            "_last_u_solution",
+            "_previous_x_solution",
+            "_previous_u_solution",
+            "_consecutive_solver_failure_count",
+            "_last_failure_reset_triggered",
+            "_last_was_stop_goal",
+            "_solver_failure_log_event_count",
+            "_solver_failure_emergency_logged",
+        )
+        snapshot = {
+            name: copy.deepcopy(getattr(self, name))
+            for name in mutable_fields
+            if hasattr(self, name)
+        }
+        result: Dict[str, object] = {
+            "solved": False,
+            "status": "probe_not_run",
+            "solve_time_ms": 0.0,
+            "cost_terms": {},
+            "dynamic_cost": 0.0,
+        }
+        try:
+            self.plan_trajectory(
+                current_state=current_state,
+                destination_state=destination_state,
+                object_snapshots=object_snapshots,
+                current_acceleration_mps2=float(current_acceleration_mps2),
+                current_steering_rad=float(current_steering_rad),
+                lane_center_reference_samples=lane_center_reference_samples,
+                stop_goal_active=bool(stop_goal_active),
+                road_envelope_payload_world=road_envelope_payload_world,
+            )
+            status = str(getattr(self, "_last_status", "")).strip().lower()
+            cost_terms = dict(getattr(self, "_last_cost_terms", {}) or {})
+            dynamic_cost = sum(
+                max(0.0, float(value))
+                for value in cost_terms.values()
+                if isinstance(value, (int, float)) and math.isfinite(float(value))
+            )
+            result = {
+                "solved": status in {"solved", "solved inaccurate"},
+                "status": str(status or "unknown"),
+                "solve_time_ms": float(
+                    getattr(self, "_last_solve_time_ms", 0.0) or 0.0
+                ),
+                "cost_terms": cost_terms,
+                # Keep probe cost numerically subordinate to behavior safety
+                # and route costs while still breaking ties by trackability.
+                "dynamic_cost": 0.001 * float(dynamic_cost),
+            }
+        except Exception as exc:
+            result["status"] = "probe_exception:" + str(exc)
+        finally:
+            for name, value in snapshot.items():
+                setattr(self, name, value)
+        return result

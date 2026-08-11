@@ -14,8 +14,11 @@ setup(
     
     package_data={
         "cpx_planning": [
+            "config/*.yaml",
             "MPC/*.yaml",
+            "behavior_planner/*.yaml",
             "Global_Planner/*.sh",
+            "Global_Planner/*.yaml",
             "Global_Planner/maps/*.xodr",
         ],
     },

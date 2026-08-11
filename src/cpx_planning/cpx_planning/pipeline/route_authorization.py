@@ -132,7 +132,11 @@ def authorize_route_lane_change(
         return _denied("required_lane_direction_mismatch_right_change", maneuver, remaining_distance_m, target_lane_id)
 
     distance = _finite_or_none(remaining_distance_m)
-    if distance is not None:
+    explicit_lane_change = maneuver in {
+        RouteManeuver.LANE_CHANGE_LEFT,
+        RouteManeuver.LANE_CHANGE_RIGHT,
+    }
+    if distance is not None and not explicit_lane_change:
         if float(distance) > float(preparation_start_distance_m):
             return _denied("maneuver_too_far_for_lane_change", maneuver, distance, target_lane_id)
         if float(distance) < float(latest_start_distance_m):

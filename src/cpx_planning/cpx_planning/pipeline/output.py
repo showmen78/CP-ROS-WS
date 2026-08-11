@@ -7,15 +7,6 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 
 @dataclass(frozen=True)
-class PlannerControl:
-    """CARLA-independent form of the throttle, brake, and normalized steering command used inside the original pipeline."""
-
-    throttle: float = 0.0
-    brake: float = 0.0
-    steer: float = 0.0
-
-
-@dataclass(frozen=True)
 class BehaviorCommand:
     """Behavior-layer decision exposed in PlannerOutput."""
 
@@ -24,6 +15,8 @@ class BehaviorCommand:
     target_speed_mps: float = 0.0
     stop_target: Optional[Mapping[str, object]] = None
     reroute_requested: bool = False
+    normal_stop: bool = False
+    stop_requested: bool = False
     emergency_brake: bool = False
     fsm_state: str = "LANE_KEEP"
     debug_reason: str = ""
@@ -36,6 +29,8 @@ class BehaviorCommand:
         target_speed_mps: float,
     ) -> "BehaviorCommand":
         decision = str(behavior_debug.get("decision", "lane_follow"))
+        normal_stop = decision in {"stop_at_intersection", "stop_sign"}
+        emergency_brake = decision == "emergency_brake"
         return cls(
             decision=decision,
             target_lane_id=_to_int(behavior_debug.get("target_lane_id", 0)),
@@ -46,7 +41,9 @@ class BehaviorCommand:
                 else None
             ),
             reroute_requested=bool(behavior_debug.get("reroute_requested", False)),
-            emergency_brake=decision in {"emergency_brake", "stop_at_intersection", "stop_sign"},
+            normal_stop=bool(normal_stop),
+            stop_requested=bool(normal_stop or emergency_brake),
+            emergency_brake=bool(emergency_brake),
             fsm_state=str(behavior_debug.get("lc_state", "LANE_KEEP")),
             debug_reason=str(
                 behavior_debug.get("debug_reason", behavior_debug.get("pipeline_error", ""))
@@ -60,6 +57,8 @@ class BehaviorCommand:
             "target_speed_mps": float(self.target_speed_mps),
             "stop_target": dict(self.stop_target or {}),
             "reroute_requested": bool(self.reroute_requested),
+            "normal_stop": bool(self.normal_stop),
+            "stop_requested": bool(self.stop_requested),
             "emergency_brake": bool(self.emergency_brake),
             "fsm_state": str(self.fsm_state),
             "debug_reason": str(self.debug_reason),

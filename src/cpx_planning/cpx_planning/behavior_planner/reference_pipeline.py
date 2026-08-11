@@ -117,6 +117,49 @@ def lane_center_destination_from_reference(
     return destination
 
 
+def lane_center_destination_from_reference_arc_length(
+    *,
+    destination_state: Sequence[float] | None,
+    lane_center_reference: Sequence[Mapping[str, object]] | None,
+    target_arc_length_m: float,
+) -> List[float] | None:
+    """Select a turn destination by path distance, not ego-body forward axis."""
+
+    if destination_state is None:
+        return None
+    destination = list(destination_state)
+    samples = list(lane_center_reference or [])
+    if len(destination) < 4 or not samples:
+        return destination
+
+    target_s_m = max(0.5, float(target_arc_length_m))
+    chosen = samples[-1]
+    accumulated_m = 0.0
+    previous = None
+    for sample in samples:
+        try:
+            x_m = float(sample.get("x_ref_m", sample.get("x", "")))
+            y_m = float(sample.get("y_ref_m", sample.get("y", "")))
+        except Exception:
+            continue
+        if previous is not None:
+            accumulated_m += math.hypot(x_m - previous[0], y_m - previous[1])
+        chosen = sample
+        previous = (x_m, y_m)
+        if accumulated_m >= target_s_m:
+            break
+
+    try:
+        destination[0] = float(chosen.get("x_ref_m", chosen.get("x", destination[0])))
+        destination[1] = float(chosen.get("y_ref_m", chosen.get("y", destination[1])))
+        destination[3] = float(chosen.get("heading_rad", destination[3]))
+        if len(destination) >= 5:
+            destination[4] = float(chosen.get("lane_id", destination[4]))
+    except Exception:
+        return destination
+    return destination
+
+
 def is_lane_change_reference_decision(decision: object) -> bool:
     normalized = str(decision or "").strip().lower()
     return normalized in {
@@ -569,18 +612,13 @@ class MpcReferenceGenerationContext:
     def __init__(self, **kwargs: object) -> None:
         field_names = set(self.__dataclass_fields__.keys())
         unknown_keys = set(kwargs.keys()) - field_names
-
         if unknown_keys:
             unknown = ", ".join(sorted(str(key) for key in unknown_keys))
-            raise TypeError(
-                f"Unexpected MpcReferenceGenerationContext argument(s): {unknown}"
-            )
+            raise TypeError(f"Unexpected MpcReferenceGenerationContext argument(s): {unknown}")
 
         for name in self.__dataclass_fields__:
             if name not in kwargs:
-                raise TypeError(
-                    f"Missing MpcReferenceGenerationContext argument: {name}"
-                )
+                raise TypeError(f"Missing MpcReferenceGenerationContext argument: {name}")
             object.__setattr__(self, name, kwargs[name])
 
 

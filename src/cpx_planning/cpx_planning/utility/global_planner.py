@@ -165,6 +165,26 @@ def world_heading_rad(waypoint: Waypoint | None) -> float | None:
     return _wrap_angle(-float(heading))
 
 
+def lane_step_xy_heading(x_m: float, y_m: float, distance_m: float, *, get_waypoint_fn):
+    """Advance along a custom lane center for obstacle prediction."""
+
+    waypoint = get_waypoint_fn({"x": float(x_m), "y": float(y_m), "z": 0.0})
+    if waypoint is None:
+        return None
+    if abs(float(distance_m)) <= 1.0e-6:
+        candidate = waypoint
+    else:
+        stepper = waypoint.next if float(distance_m) >= 0.0 else waypoint.previous
+        candidates = list(stepper(abs(float(distance_m))) or [])
+        if not candidates:
+            return None
+        candidate = candidates[0]
+    position = getattr(candidate, "position", None)
+    if not isinstance(position, Mapping):
+        return None
+    return float(position["x"]), float(position["y"]), float(world_heading_rad(candidate) or 0.0)
+
+
 def _point_dict(point: Mapping[str, object] | Sequence[object]) -> Dict[str, float]:
     if isinstance(point, Mapping):
         return {
@@ -548,9 +568,7 @@ class CustomGlobalPlannerAdapter:
             )
             delta = _wrap_angle(after - before)
             if abs(delta) >= math.radians(28.0):
-                # Route points use CARLA/world coordinates, where the y axis has the opposite sign from the
-                # ENU coordinates used internally by AD-map. Match OpenCDA's RoadOption left/right meaning.
-                option = "RIGHT" if delta > 0.0 else "LEFT"
+                option = "LEFT" if delta > 0.0 else "RIGHT"
             elif abs(delta) >= math.radians(10.0):
                 option = "STRAIGHT"
             else:
@@ -561,15 +579,10 @@ class CustomGlobalPlannerAdapter:
 
     @staticmethod
     def _next_macro_maneuver(options: Sequence[str], start_index: int) -> str:
-        normalized = [str(option).strip().upper() for option in list(options[max(0, int(start_index)):])]
-        for option in normalized:
-            if option in {"LEFT", "CHANGELANELEFT"}:
-                return "Left Turn"
-            if option in {"RIGHT", "CHANGELANERIGHT"}:
-                return "Right Turn"
-        for option in normalized:
-            if option == "STRAIGHT":
-                return "Continue Straight"
+        labels = {"LEFT": "Turn Left", "RIGHT": "Turn Right", "STRAIGHT": "Continue Straight"}
+        for option in options[max(0, int(start_index)):]:
+            if str(option).upper() in labels:
+                return labels[str(option).upper()]
         return "Continue Straight"
 
     def _failure_summary(

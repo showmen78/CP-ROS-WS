@@ -1,5 +1,6 @@
 """Publish nearby OpenCDA V2X CAVs as Autoware tracked objects."""
 
+import json
 import math
 import uuid
 
@@ -10,6 +11,7 @@ from autoware_perception_msgs.msg import TrackedObjectKinematics
 from autoware_perception_msgs.msg import TrackedObjects
 import rclpy
 from rclpy.node import Node
+from std_msgs.msg import String
 
 from .tcp_json_receiver import TcpJsonReceiver
 
@@ -35,6 +37,8 @@ def _classification_label(type_name):
         return ObjectClassification.MOTORCYCLE
     if "bicycle" in name or "bike" in name:
         return ObjectClassification.BICYCLE
+    if "pedestrian" in name or "walker" in name:
+        return ObjectClassification.PEDESTRIAN
     if "vehicle" in name or "car" in name:
         return ObjectClassification.CAR
     return ObjectClassification.UNKNOWN
@@ -50,6 +54,8 @@ class V2XPublisher(Node):
             "/cpx/v2x",
             10,
         )
+        # Preserve the complete CP dictionaries as well as their typed object view.
+        self.cp_obstacles_publisher = self.create_publisher(String, "/cpx/cp_obstacles", 10)
         self.receiver = TcpJsonReceiver(5054, self.get_logger())
         self.create_timer(0.02, self.publish_messages)
 
@@ -121,6 +127,10 @@ class V2XPublisher(Node):
                 message.objects.append(tracked)
 
             self.publisher.publish(message)
+
+            cp_message = String()
+            cp_message.data = json.dumps({"schema_version": int(payload.get("schema_version", 1) or 1), "timestamp_s": float(payload.get("timestamp_s", timestamp_s) or timestamp_s), "obstacles": [dict(item) for item in list(payload.get("cp_obstacles", []) or []) if isinstance(item, dict)]}, allow_nan=False, separators=(",", ":"))
+            self.cp_obstacles_publisher.publish(cp_message)
 
     def destroy_node(self):
         self.receiver.close()

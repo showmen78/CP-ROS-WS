@@ -28,6 +28,7 @@ TOPICS = {
         CooperativeMessageArray,
         "/cpx/cooperative_messages",
     ),
+    "safety_status": (String, "/cpx/safety_status"),
     "debug_output": (String, "/cpx/debug_output"),
     "planner_control": (Control, "/control/command/control_cmd"),
 }
@@ -81,11 +82,14 @@ class DataSubscriber(Node):
 
         # Send a small, direct control payload so OpenCDA can later convert it to carla.VehicleControl.
         if data_type == "planner_control":
+            cycle_time_s = float(message.stamp.sec) + float(message.stamp.nanosec) / 1000000000.0
             forwarded_data["data"] = {
+                "cycle_time_s": cycle_time_s,
                 "target_speed_mps": float(message.longitudinal.velocity),
                 "acceleration_mps2": float(message.longitudinal.acceleration),
                 "steering_rad": float(message.lateral.steering_tire_angle),
             }
+            forwarded_data["timestamp_s"] = cycle_time_s
 
         # Keep the comparison stream and the real control stream available at the same time.
         if data_type in {"debug_output", "planner_control"}:

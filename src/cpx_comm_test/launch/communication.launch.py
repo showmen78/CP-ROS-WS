@@ -34,6 +34,11 @@ def generate_launch_description():
         ),
         Node(
             package="cpx_comm_test",
+            executable="safety_status_publisher",
+            output="screen",
+        ),
+        Node(
+            package="cpx_comm_test",
             executable="data_subscriber",
             output="screen",
         ),

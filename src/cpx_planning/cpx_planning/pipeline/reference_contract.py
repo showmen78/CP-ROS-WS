@@ -38,6 +38,8 @@ class ReferenceValidationResult:
     max_point_jump_m: float = 0.0
     max_heading_jump_rad: float = 0.0
     max_curvature_1pm: float = 0.0
+    contract_max_curvature_1pm: float = 0.0
+    curvature_margin_1pm: float = 0.0
 
     def reason(self) -> str:
         return ";".join(dict.fromkeys(str(v) for v in self.violations if str(v)))
@@ -60,6 +62,18 @@ def contract_from_config(
         max_body_default,
     )
     max_body = None if max_body_value is None else float(max_body_value)
+    configured_max_curvature_1pm = float(
+        config.get(
+            prefix + "max_curvature_1pm",
+            defaults["max_curvature_1pm"],
+        )
+    )
+    vehicle_max_curvature = config.get("reference_vehicle_max_curvature_1pm")
+    if vehicle_max_curvature is not None:
+        configured_max_curvature_1pm = min(
+            float(configured_max_curvature_1pm),
+            max(1.0e-3, float(vehicle_max_curvature)),
+        )
     return ReferenceContract(
         mode=normalized_mode,
         expected_lane_id=int(expected_lane_id),
@@ -70,7 +84,7 @@ def contract_from_config(
         max_destination_body_lateral_abs_m=max_body,
         max_point_jump_m=float(config.get(prefix + "max_point_jump_m", defaults["max_point_jump_m"])),
         max_heading_jump_rad=float(config.get(prefix + "max_heading_jump_rad", defaults["max_heading_jump_rad"])),
-        max_curvature_1pm=float(config.get(prefix + "max_curvature_1pm", defaults["max_curvature_1pm"])),
+        max_curvature_1pm=float(configured_max_curvature_1pm),
         max_speed_mps=float(config.get(prefix + "max_speed_mps", default_speed_mps)),
         require_monotonic_progress=bool(
             config.get(
@@ -79,7 +93,7 @@ def contract_from_config(
             )
         ),
         require_zero_terminal_speed=bool(config.get(prefix + "require_zero_terminal_speed", normalized_mode == "stop")),
-        allow_lane_transition=bool(config.get(prefix + "allow_lane_transition", normalized_mode == "lane_change")),
+        allow_lane_transition=bool(config.get(prefix + "allow_lane_transition", normalized_mode in ("lane_change", "lane_change_direct"))),
         allow_route_branch=bool(config.get(prefix + "allow_route_branch", normalized_mode == "intersection_turn")),
         allow_padding=bool(config.get(prefix + "allow_padding", True)),
     )
@@ -94,7 +108,11 @@ def validate_reference_contract(
     check_destination_body_lateral: bool,
 ) -> ReferenceValidationResult:
     samples = [dict(sample) for sample in list(reference_samples or [])]
-    result = ReferenceValidationResult(valid=True)
+    result = ReferenceValidationResult(
+        valid=True,
+        contract_max_curvature_1pm=float(contract.max_curvature_1pm),
+        curvature_margin_1pm=float(contract.max_curvature_1pm),
+    )
     violations: list[str] = []
     if len(ego_state) < 4:
         return ReferenceValidationResult(valid=False, violations=["missing_ego_state"])
@@ -104,6 +122,7 @@ def validate_reference_contract(
         violations.append("horizon_too_short")
 
     points: list[tuple[float, float]] = []
+    point_samples: list[Mapping[str, object]] = []
     speeds: list[float] = []
     lane_ids: list[int] = []
     progress_values: list[float] = []
@@ -118,6 +137,7 @@ def validate_reference_contract(
             violations.append(f"sample_{index}_not_finite")
             continue
         points.append((x_m, y_m))
+        point_samples.append(sample)
         lane_ids.append(_to_int(sample.get("lane_id", contract.expected_lane_id), contract.expected_lane_id))
         speed = _sample_speed_mps(sample)
         if speed is not None:
@@ -150,8 +170,12 @@ def validate_reference_contract(
     ):
         bad_lanes = [
             lane_id
-            for lane_id in lane_ids
-            if int(lane_id) != 0 and int(lane_id) != int(contract.expected_lane_id)
+            for lane_id, sample in zip(lane_ids, point_samples)
+            if (
+                int(lane_id) != 0
+                and int(lane_id) != int(contract.expected_lane_id)
+                and not _is_longitudinal_lane_successor(sample)
+            )
         ]
         if bad_lanes:
             violations.append("lane_id_transition_not_allowed")
@@ -183,6 +207,9 @@ def validate_reference_contract(
         result.max_curvature_1pm = max(result.max_curvature_1pm, float(curvature))
         if curvature > float(contract.max_curvature_1pm):
             violations.append("curvature_out_of_contract")
+    result.curvature_margin_1pm = (
+        float(contract.max_curvature_1pm) - float(result.max_curvature_1pm)
+    )
 
     if destination_state is not None and len(destination_state) >= 2:
         try:
@@ -199,6 +226,7 @@ def validate_reference_contract(
                 y_m=dest_y,
                 reference_points=points,
                 reference_lane_ids=lane_ids,
+                reference_samples=point_samples,
                 expected_lane_id=(
                     0
                     if bool(contract.allow_route_branch)
@@ -230,6 +258,13 @@ def validate_reference_contract(
     return result
 
 
+def _is_longitudinal_lane_successor(sample: Mapping[str, object]) -> bool:
+    """Return whether a lane-id change is a trusted CARLA topology successor."""
+
+    transition_kind = str(sample.get("lane_transition_kind", "")).strip().lower()
+    return transition_kind == "longitudinal_successor"
+
+
 def _mode_defaults(mode: str) -> Mapping[str, object]:
     common = {
         "max_point_jump_m": 4.0,
@@ -252,6 +287,19 @@ def _mode_defaults(mode: str) -> Mapping[str, object]:
         "lane_change": {
             "min_first_forward_m": 0.2,
             "max_first_lateral_abs_m": 1.25,
+            "max_destination_lane_error_m": 0.75,
+            "max_destination_body_lateral_abs_m": None,
+        },
+        "lane_change_direct": {
+            # Used when MPC tracks the target lane's own (unblended)
+            # centerline directly instead of a pre-shaped source-to-target
+            # blend -- the first reference sample legitimately sits close to
+            # a full lane width from ego at lock time, so the "lane_change"
+            # mode's tighter 1.25m limit (sized for an already-ramping
+            # blend) would veto every such reference. Sized to cover one
+            # lane width plus margin.
+            "min_first_forward_m": 0.2,
+            "max_first_lateral_abs_m": 4.0,
             "max_destination_lane_error_m": 0.75,
             "max_destination_body_lateral_abs_m": None,
         },
@@ -300,12 +348,22 @@ def _nearest_lane_error_m(
     y_m: float,
     reference_points: Sequence[tuple[float, float]],
     reference_lane_ids: Sequence[int],
+    reference_samples: Sequence[Mapping[str, object]],
     expected_lane_id: int,
 ) -> float:
     candidates = [
         point
-        for point, lane_id in zip(reference_points, reference_lane_ids)
-        if int(expected_lane_id) == 0 or int(lane_id) == 0 or int(lane_id) == int(expected_lane_id)
+        for point, lane_id, sample in zip(
+            reference_points,
+            reference_lane_ids,
+            reference_samples,
+        )
+        if (
+            int(expected_lane_id) == 0
+            or int(lane_id) == 0
+            or int(lane_id) == int(expected_lane_id)
+            or _is_longitudinal_lane_successor(sample)
+        )
     ]
     if not candidates:
         candidates = list(reference_points)
