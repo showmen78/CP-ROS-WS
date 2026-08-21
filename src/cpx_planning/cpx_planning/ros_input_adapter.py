@@ -107,12 +107,9 @@ class ROSInputAdapter:
         self._cooperative = message
 
     def update_cp_obstacles(self, message):
-        """Save the exact CP obstacle dictionaries produced by the new OpenCDA provider."""
-        try:
-            payload = json.loads(str(message.data or "{}"))
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("Invalid /cpx/cp_obstacles JSON payload.") from exc
-        self._cp_obstacles = payload if isinstance(payload, Mapping) else {}
+        """Save cooperative obstacles published through the standard tracked-object interface."""
+        self._check_frame(message)
+        self._cp_obstacles = message
 
     def update_safety_status(self, message):
         """Save the current OpenCDA safety flags for the copied final safety filter."""
@@ -136,6 +133,7 @@ class ROSInputAdapter:
             self._stamp_seconds(self._localization.header.stamp),
             self._stamp_seconds(self._perception.header.stamp),
             self._stamp_seconds(self._v2x.header.stamp),
+            self._stamp_seconds(self._cp_obstacles.header.stamp),
             self._stamp_seconds(self._traffic_lights.header.stamp),
             self._stamp_seconds(self._final_destination.header.stamp),
             float(self._safety_status.get("timestamp_s", 0.0) or 0.0),
@@ -153,11 +151,11 @@ class ROSInputAdapter:
             raise RuntimeError("ROS planner inputs are not ready.")
         snapshot = self._make_snapshot()
         self._update_route(ego_pose=snapshot.ego_pose, final_goal=snapshot.final_goal)
-        cp_obstacles = [dict(item) for item in list(self._cp_obstacles.get("obstacles", []) or []) if isinstance(item, Mapping)]
+        cp_obstacles = self._cp_obstacle_list(message=self._cp_obstacles, ego_pose=snapshot.ego_pose, sim_time_s=float(snapshot.timestamp_s))
         traffic_controls = [control for control in (self._traffic_light_to_control_message(traffic_light=traffic_light, ego_pose=snapshot.ego_pose, sim_time_s=float(snapshot.timestamp_s)) for traffic_light in snapshot.traffic_lights) if control is not None]
         cp_payload = {
-            "schema_version": int(self._cp_obstacles.get("schema_version", 1) or 1),
-            "timestamp_s": float(self._cp_obstacles.get("timestamp_s", snapshot.timestamp_s) or snapshot.timestamp_s),
+            "schema_version": 1,
+            "timestamp_s": self._stamp_seconds(self._cp_obstacles.header.stamp),
             "obstacles": [dict(item) for item in cp_obstacles],
             "control": [dict(item) for item in traffic_controls],
             "lane_closures": [dict(item) for item in snapshot.lane_events],
@@ -482,6 +480,56 @@ class ROSInputAdapter:
                 }
             )
         return output
+
+    def _cp_obstacle_list(self, *, message, ego_pose, sim_time_s):
+        """Rebuild OpenCDA's CP obstacle contract from the common ROS tracked-object fields."""
+        tracked_objects = self._tracked_objects(message, source="opencda_multi_vantage", provider_source="native_opencda_multi_vantage")
+        ttl_s = max(0.2, 2.0 * float(self.mpc.dt_s))
+        output = []
+        for tracked in tracked_objects:
+            x_m = float(tracked["x"])
+            y_m = float(tracked["y"])
+            z_m = float(tracked.get("z", 0.0))
+            speed_mps = float(tracked.get("v", 0.0))
+            heading_rad = float(tracked.get("psi", 0.0))
+            waypoint = self.map_planner.get_waypoint({"x": x_m, "y": y_m, "z": z_m})
+            lane_id = int(canonical_lane_id_for_waypoint(waypoint)) if waypoint is not None else 0
+            road_id = int(getattr(waypoint, "road_id", -1) or -1) if waypoint is not None else -1
+            distance_m = math.hypot(x_m - float(ego_pose["x"]), y_m - float(ego_pose["y"]))
+            object_id = str(tracked.get("vehicle_id", tracked.get("id", "")))
+            object_type = str(tracked.get("type", "unknown"))
+            if object_type == "car":
+                object_type = "vehicle"
+            output.append({
+                "id": "native_opencda_multi_vantage:{}".format(object_id),
+                "type": object_type,
+                "source": "opencda_multi_vantage",
+                "provider_source": "native_opencda_multi_vantage",
+                "timestamp_s": float(sim_time_s),
+                "ttl_s": float(ttl_s),
+                "confidence": float(tracked.get("confidence", 1.0)),
+                "distance_m": float(distance_m),
+                "state": [x_m, y_m, speed_mps, heading_rad],
+                "z": z_m,
+                "shape": {"length_m": float(tracked.get("length_m", 0.0)), "width_m": float(tracked.get("width_m", 0.0)), "height_m": float(tracked.get("height_m", 0.0))},
+                "road_id": int(road_id),
+                "lane_id": int(lane_id),
+                "trajectory": self._constant_velocity_trajectory(x_m=x_m, y_m=y_m, speed_mps=speed_mps, heading_rad=heading_rad),
+                "observed_by_cav_ids": [],
+                "not_observed_by_cav_ids": [],
+                "visibility_by_cav_id": {},
+                "blind_spot_shared": False,
+            })
+        return output
+
+    def _constant_velocity_trajectory(self, *, x_m, y_m, speed_mps, heading_rad):
+        """Create the same CP constant-velocity trajectory shape used by New OpenCDA."""
+        horizon_s = float(self.mpc.horizon_s)
+        dt_s = float(self.mpc.dt_s)
+        steps = max(1, int(round(horizon_s / dt_s)))
+        cos_h = math.cos(float(heading_rad))
+        sin_h = math.sin(float(heading_rad))
+        return [[float(x_m + speed_mps * cos_h * index * dt_s), float(y_m + speed_mps * sin_h * index * dt_s), float(speed_mps), float(heading_rad)] for index in range(steps + 1)]
 
     def _traffic_light_list(self, message):
         """Convert received traffic-light observations into the dictionaries used by traffic planning."""

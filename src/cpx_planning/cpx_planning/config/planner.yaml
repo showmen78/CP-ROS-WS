@@ -45,17 +45,17 @@ planner:
   opencda_style_reference_conditioning_enabled: false
   lane_follow_speed_recovery_enabled: false
   lane_follow_negative_accel_release_enabled: false
-  overspeed_guard_enabled: false
+  overspeed_guard_enabled: true
   overspeed_margin_mps: 0.5
   overspeed_min_brake: 0.2
   overspeed_max_brake: 0.65
-  low_speed_lateral_recovery_enabled: false
+  low_speed_lateral_recovery_enabled: true
   low_speed_lateral_recovery_speed_mps: 0.8
   low_speed_lateral_recovery_threshold_m: 1.2
   low_speed_lateral_recovery_target_speed_mps: 1.0
   low_speed_lateral_recovery_max_steer_rad: 0.18
   full_lane_change_start_lock_s: 8.0
-  full_dense_traffic_lane_change_lock_enabled: false
+  full_dense_traffic_lane_change_lock_enabled: true
   full_dense_traffic_object_count: 8
   full_dense_traffic_risky_lane_count: 2
   full_prepare_lane_change_reference_lock: true

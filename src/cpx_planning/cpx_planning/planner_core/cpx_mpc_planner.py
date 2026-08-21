@@ -62,6 +62,9 @@ class CPXMPCPlannerBridge:
         config: Optional[Mapping[str, Any]] = None,
         *,
         map_planner: Any = None,
+        mpc_instance: Any = None,
+        route_manager_instance: Any = None,
+        behavior_components_enabled: bool = True,
     ):
         self._ensure_planning_module_import_path()
         del vehicle_manager
@@ -124,13 +127,13 @@ class CPXMPCPlannerBridge:
                     False,
                 )
             ),
-        )
+        ) if bool(behavior_components_enabled) else None
         from cpx_planning.pipeline.scenario_manager import (
             BoundaryRecoveryRequest,
             CPXScenarioManager,
         )
 
-        self._scenario_manager = CPXScenarioManager(self.config)
+        self._scenario_manager = CPXScenarioManager(self.config) if bool(behavior_components_enabled) else None
         self._boundary_recovery_request = BoundaryRecoveryRequest()
         self._boundary_recovery_trigger_frames = 0
         self._boundary_recovery_infeasible_frames = 0
@@ -669,7 +672,7 @@ class CPXMPCPlannerBridge:
         )
 
         mpc_cfg, road_cfg = self._load_mpc_config()
-        self.mpc = MPC(mpc_cfg=mpc_cfg, road_cfg=road_cfg)
+        self.mpc = mpc_instance if mpc_instance is not None else MPC(mpc_cfg=mpc_cfg, road_cfg=road_cfg)
         from cpx_planning.pipeline.actuator_mapper import CarlaActuatorMapper
         self.actuator_mapper = CarlaActuatorMapper(self.config)
         vehicle_curvature_margin = min(
@@ -727,7 +730,7 @@ class CPXMPCPlannerBridge:
             default_speed_mps=float(self.target_speed_mps),
         )
         from cpx_planning.pipeline.maneuver_manager import ManeuverManager
-        self.maneuver_manager = ManeuverManager(self.config)
+        self.maneuver_manager = ManeuverManager(self.config) if bool(behavior_components_enabled) else None
         self._authorize_mpc_entry = authorize_mpc_entry
         self._build_decision_record = build_decision_record
         self.safety_supervisor = SafetySupervisor(
@@ -750,49 +753,20 @@ class CPXMPCPlannerBridge:
         self.global_planner_backend = "custom_admap_dijkstra"
         self.global_planner_backend_warning = ""
         road_cfg_from_map = {"lane_count": 1, "lane_width_m": 3.5}
-        self.route_manager = CPXRouteManager(
+        self.route_manager = route_manager_instance if route_manager_instance is not None else CPXRouteManager(
             global_planner=self.global_planner,
             carla_map=None,
             carla_api=None,
-            carla_route_sampling_resolution_m=float(
-                self.config.get("carla_route_sampling_resolution_m", 1.0)
-            ),
-            carla_reference_smoothing_passes=int(
-                self.config.get("carla_reference_smoothing_passes", 3)
-            ),
-            carla_turn_connector_smoothing_passes=int(
-                self.config.get("carla_turn_connector_smoothing_passes", 16)
-            ),
-            carla_reference_boundary_aware=bool(
-                self.config.get(
-                    "carla_reference_boundary_aware",
-                    True,
-                )
-            ),
-            carla_reference_vehicle_half_width_m=float(
-                self.config.get("reference_vehicle_half_width_m", 1.0)
-            ),
-            carla_reference_boundary_margin_m=float(
-                self.config.get(
-                    "reference_contract_turn_boundary_margin_m",
-                    0.15,
-                )
-            ),
-            carla_reference_tracking_reserve_m=float(
-                self.config.get(
-                    "carla_reference_tracking_reserve_m",
-                    0.20,
-                )
-            ),
-            carla_rejoin_min_lateral_m=float(
-                self.config.get("carla_rejoin_min_lateral_m", 0.35)
-            ),
-            carla_rejoin_max_lateral_m=float(
-                self.config.get("carla_rejoin_max_lateral_m", 3.0)
-            ),
-            carla_rejoin_distance_m=float(
-                self.config.get("carla_rejoin_distance_m", 8.0)
-            ),
+            carla_route_sampling_resolution_m=float(self.config.get("carla_route_sampling_resolution_m", 1.0)),
+            carla_reference_smoothing_passes=int(self.config.get("carla_reference_smoothing_passes", 3)),
+            carla_turn_connector_smoothing_passes=int(self.config.get("carla_turn_connector_smoothing_passes", 16)),
+            carla_reference_boundary_aware=bool(self.config.get("carla_reference_boundary_aware", True)),
+            carla_reference_vehicle_half_width_m=float(self.config.get("reference_vehicle_half_width_m", 1.0)),
+            carla_reference_boundary_margin_m=float(self.config.get("reference_contract_turn_boundary_margin_m", 0.15)),
+            carla_reference_tracking_reserve_m=float(self.config.get("carla_reference_tracking_reserve_m", 0.20)),
+            carla_rejoin_min_lateral_m=float(self.config.get("carla_rejoin_min_lateral_m", 0.35)),
+            carla_rejoin_max_lateral_m=float(self.config.get("carla_rejoin_max_lateral_m", 3.0)),
+            carla_rejoin_distance_m=float(self.config.get("carla_rejoin_distance_m", 8.0)),
             reached_distance_m=float(self.config.get("route_reached_distance_m", 3.0)),
             stale_route_lateral_m=float(self.config.get("route_stale_lateral_m", 12.0)),
         )
@@ -830,7 +804,7 @@ class CPXMPCPlannerBridge:
             cooperative_message_check_frequency_hz=float(
                 self.config.get("cooperative_message_check_frequency_hz", 5.0)
             ),
-        )
+        ) if bool(behavior_components_enabled) else None
         self.cp_provider = None
         self.active_mpc_cost_profile = "lane_follow"
         self.requested_mpc_cost_profile = "lane_follow"

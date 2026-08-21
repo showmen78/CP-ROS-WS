@@ -14,6 +14,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CooperativeMessageArray.msg"
   "msg/TrafficLightObservation.msg"
   "msg/TrafficLightObservationArray.msg"
+  "msg/ComponentPacket.msg"
+  "msg/RoutePoint.msg"
+  "msg/GlobalRoute.msg"
+  "msg/PlannerInputFrame.msg"
   DEPENDENCIES
     autoware_perception_msgs
     builtin_interfaces

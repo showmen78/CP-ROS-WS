@@ -49,13 +49,14 @@ class TcpJsonReceiver:
 
         while not self.stop_event.is_set():
             try:
-                connection, _address = server.accept()
+                connection, address = server.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
 
             connection.settimeout(1.0)
+            self.logger.info("OpenCDA connected on port {} from {}:{}".format(self.tcp_port, address[0], address[1]))
             receive_buffer = b""
 
             try:

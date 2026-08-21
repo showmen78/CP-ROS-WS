@@ -1,6 +1,5 @@
 """Publish nearby OpenCDA V2X CAVs as Autoware tracked objects."""
 
-import json
 import math
 import uuid
 
@@ -11,7 +10,6 @@ from autoware_perception_msgs.msg import TrackedObjectKinematics
 from autoware_perception_msgs.msg import TrackedObjects
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
 
 from .tcp_json_receiver import TcpJsonReceiver
 
@@ -44,6 +42,42 @@ def _classification_label(type_name):
     return ObjectClassification.UNKNOWN
 
 
+def _tracked_object_from_item(item):
+    """Build the same Autoware tracked-object fields for a V2X or CP object."""
+    tracked = TrackedObject()
+    object_id = str(item.get("vehicle_id", item.get("id", "")))
+    tracked.object_id.uuid = list(uuid.uuid5(uuid.NAMESPACE_URL, "cpx:object:{}".format(object_id)).bytes)
+
+    confidence = float(item.get("confidence", 1.0))
+    tracked.existence_probability = confidence
+    classification = ObjectClassification()
+    classification.label = _classification_label(item.get("type", ""))
+    classification.probability = confidence
+    tracked.classification = [classification]
+
+    pose = tracked.kinematics.pose_with_covariance.pose
+    pose.position.x = float(item.get("x", 0.0))
+    pose.position.y = float(item.get("y", 0.0))
+    pose.position.z = float(item.get("z", 0.0))
+    yaw = item.get("psi")
+    if yaw is None:
+        pose.orientation.w = 1.0
+    else:
+        yaw = float(yaw)
+        pose.orientation.z = math.sin(yaw / 2.0)
+        pose.orientation.w = math.cos(yaw / 2.0)
+        tracked.kinematics.orientation_availability = TrackedObjectKinematics.AVAILABLE
+
+    speed = float(item.get("v", 0.0))
+    tracked.kinematics.twist_with_covariance.twist.linear.x = speed
+    tracked.kinematics.is_stationary = abs(speed) < 0.1
+    tracked.shape.type = Shape.BOUNDING_BOX
+    tracked.shape.dimensions.x = float(item.get("length_m") or 0.0)
+    tracked.shape.dimensions.y = float(item.get("width_m") or 0.0)
+    tracked.shape.dimensions.z = float(item.get("height_m") or 0.0)
+    return tracked
+
+
 class V2XPublisher(Node):
     """Receive nearby-CAV JSON and publish tracked objects."""
 
@@ -54,8 +88,8 @@ class V2XPublisher(Node):
             "/cpx/v2x",
             10,
         )
-        # Preserve the complete CP dictionaries as well as their typed object view.
-        self.cp_obstacles_publisher = self.create_publisher(String, "/cpx/cp_obstacles", 10)
+        # CP obstacles use the same typed ROS interface as perception objects.
+        self.cp_obstacles_publisher = self.create_publisher(TrackedObjects, "/cpx/cp_obstacles", 10)
         self.receiver = TcpJsonReceiver(5054, self.get_logger())
         self.create_timer(0.02, self.publish_messages)
 
@@ -71,65 +105,15 @@ class V2XPublisher(Node):
             message.header.frame_id = str(data.get("frame_id", "map"))
 
             for item in payload.get("nearby_cavs", []):
-                tracked = TrackedObject()
-                
-                # Use the original vehicle ID so that this UUID matches the perception
-                # UUID when both sources report the same vehicle.
-                cav_id = str(
-                    item.get("vehicle_id", item.get("id", ""))
-                )
-
-                tracked.object_id.uuid = list(
-                    uuid.uuid5(
-                        uuid.NAMESPACE_URL,
-                        "cpx:object:{}".format(cav_id),
-                    ).bytes
-                )
-
-                confidence = float(item.get("confidence", 1.0))
-                tracked.existence_probability = confidence
-
-                classification = ObjectClassification()
-                classification.label = _classification_label(
-                    item.get("type", "")
-                )
-                classification.probability = confidence
-                tracked.classification = [classification]
-
-                pose = tracked.kinematics.pose_with_covariance.pose
-                pose.position.x = float(item.get("x", 0.0))
-                pose.position.y = float(item.get("y", 0.0))
-                pose.position.z = float(item.get("z", 0.0))
-
-                yaw = float(item.get("psi", 0.0))
-                pose.orientation.z = math.sin(yaw / 2.0)
-                pose.orientation.w = math.cos(yaw / 2.0)
-                tracked.kinematics.orientation_availability = (
-                    TrackedObjectKinematics.AVAILABLE
-                )
-
-                speed = float(item.get("v", 0.0))
-                tracked.kinematics.twist_with_covariance.twist.linear.x = (
-                    speed
-                )
-                tracked.kinematics.is_stationary = abs(speed) < 0.1
-
-                tracked.shape.type = Shape.BOUNDING_BOX
-                tracked.shape.dimensions.x = float(
-                    item.get("length_m") or 0.0
-                )
-                tracked.shape.dimensions.y = float(
-                    item.get("width_m") or 0.0
-                )
-                tracked.shape.dimensions.z = float(
-                    item.get("height_m") or 0.0
-                )
-                message.objects.append(tracked)
+                message.objects.append(_tracked_object_from_item(item))
 
             self.publisher.publish(message)
 
-            cp_message = String()
-            cp_message.data = json.dumps({"schema_version": int(payload.get("schema_version", 1) or 1), "timestamp_s": float(payload.get("timestamp_s", timestamp_s) or timestamp_s), "obstacles": [dict(item) for item in list(payload.get("cp_obstacles", []) or []) if isinstance(item, dict)]}, allow_nan=False, separators=(",", ":"))
+            cp_message = TrackedObjects()
+            _set_stamp(cp_message.header.stamp, timestamp_s)
+            cp_message.header.frame_id = str(data.get("frame_id", "map"))
+            for item in payload.get("cp_obstacles", []):
+                cp_message.objects.append(_tracked_object_from_item(item))
             self.cp_obstacles_publisher.publish(cp_message)
 
     def destroy_node(self):

@@ -48,4 +48,11 @@ env/
 *.log
 *.jsonl
 
+# Local comparison output copied from OpenCDA
+/opencda/
+/ros_planner_input_adapter_output.jsonl
+
+# Local planning notes
+/PLANNER_NODE_SEPARATION_PLAN.md
+
 /src/cpx_planning/test/

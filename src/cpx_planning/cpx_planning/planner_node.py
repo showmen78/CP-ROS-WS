@@ -6,24 +6,27 @@ from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 import json
 import math
-import os
 from pathlib import Path
+import threading
+import time
 
 from autoware_control_msgs.msg import Control
 from autoware_perception_msgs.msg import TrackedObjects
 from builtin_interfaces.msg import Time
-from cpx_interfaces.msg import CooperativeMessageArray, TrafficLightObservationArray
+from cpx_interfaces.msg import CooperativeMessageArray, PlannerInputFrame, TrafficLightObservationArray
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
+from cpx_planning.component_interfaces import DistributedInputAdapter, PlannerLocation, RemoteBehaviorContextProxy, RemoteBehaviorDecisionProxy, RemoteGlobalPlannerProxy, RemoteMPCProxy, RemoteReferencePipeline, RemoteRouteManagerProxy, cycle_id_from_timestamp, encode_json, fill_header, load_planner_configuration
 from cpx_planning.planner_core.cpx_mpc_planner import CPXMPCPlannerBridge
 from cpx_planning.ros_input_adapter import ROSInputAdapter
 from cpx_planning.ros_output_adapter import ROSOutputAdapter
-from cpx_planning.utility.config_loader import deep_merge_dicts, load_yaml_file
-from cpx_planning.utility.global_planner import CustomGlobalPlannerAdapter
 
 
 def _default_planner_input_log_path():
@@ -79,61 +82,63 @@ def _time_message(timestamp_s):
 class CPXPlannerNode(Node):
     """Receive raw ROS data and run the same CP-X bridge used by OpenCDA."""
 
-    def __init__(self):
-        super().__init__("cpx_planner")
+    def __init__(self, local_map_planner=None, local_bus=None):
+        super().__init__("planner_node")
         package_root = Path(__file__).resolve().parent
         self.package_root = package_root
-        self.declare_parameter("xodr_path", str(package_root / "Global_Planner" / "maps" / "Town10HD_Opt.xodr"))
-        self.declare_parameter("cache_root", str(Path.home() / ".cache" / "cpx_planning" / "global_planner"))
-        self.declare_parameter("ad_map_install_root", os.environ.get("GLOBAL_PLANNER_AD_MAP_INSTALL", ""))
+        self.local_bus = local_bus
         self.declare_parameter("planner_input_log_path", str(_default_planner_input_log_path()))
         self.declare_parameter("control_topic", "/control/command/control_cmd")
-
-        xodr_path = str(self.get_parameter("xodr_path").value)
-        if not Path(xodr_path).is_file():
-            raise FileNotFoundError("OpenDRIVE map not found: {}".format(xodr_path))
-        ad_map_install_root = str(self.get_parameter("ad_map_install_root").value).strip()
-        self.global_planner = CustomGlobalPlannerAdapter(xodr_path=xodr_path, cache_root=str(self.get_parameter("cache_root").value), route_sample_distance_m=2.0, ad_map_install_root=ad_map_install_root or None)
-        self.global_planner.load()
-
-        planner_config = self._load_planner_configuration()
-        self.planner_bridge = CPXMPCPlannerBridge(vehicle_manager=None, config=planner_config, map_planner=self.global_planner)
+        self.declare_parameter("debug", False)
+        self.declare_parameter("planning_period_s", 0.05)
+        self.debug = bool(self.get_parameter("debug").value)
+        planner_config = load_planner_configuration(package_root)
+        planner_config["debug"] = bool(self.debug)
+        planner_config["record_debug"] = bool(self.debug)
+        planner_config["record_evaluation_metrics"] = bool(self.debug)
+        self.global_planner = RemoteGlobalPlannerProxy(self, local_map_planner=local_map_planner, local_bus=local_bus)
+        self.route_manager = RemoteRouteManagerProxy(self, local_bus=local_bus)
+        self.mpc = RemoteMPCProxy(self, local_bus=local_bus)
+        self.planner_bridge = CPXMPCPlannerBridge(vehicle_manager=None, config=planner_config, map_planner=self.global_planner, mpc_instance=self.mpc, route_manager_instance=self.route_manager, behavior_components_enabled=False)
+        self.behavior_context = RemoteBehaviorContextProxy(self, local_bus=local_bus)
+        self.behavior_decision = RemoteBehaviorDecisionProxy(self, local_bus=local_bus)
+        self.reference_proxy = RemoteReferencePipeline(self, local_bus=local_bus)
+        self.planner_bridge._full_traffic_memory = self.behavior_context.traffic_memory
+        self.planner_bridge._scenario_manager = self.behavior_context.scenario_manager
+        self.planner_bridge.behavior_planner = self.behavior_decision
+        self.planner_bridge.maneuver_manager = self.reference_proxy
+        self.planner_bridge.reference_pipeline = self.reference_proxy
         self.input_adapter = ROSInputAdapter(bridge=self.planner_bridge)
-        self.planner_bridge.input_adapter = self.input_adapter
         self.latest_planner_output = None
         self.latest_control_message = None
         self.latest_adapter_output = None
+        self.latest_planning_cycle_time_ms = 0.0
         self._last_frame_timestamp_s = None
         self._waiting_message_printed = False
+        self._planning_lock = threading.RLock()
+        self._planning_callback_group = MutuallyExclusiveCallbackGroup()
 
         self.ros_output_adapter = ROSOutputAdapter()
         self.control_publisher = self.create_publisher(Control, str(self.get_parameter("control_topic").value), 10)
-        self.debug_output_publisher = self.create_publisher(String, "/cpx/debug_output", 10)
+        self.tcp_control_output_publisher = self.create_publisher(String, "/cpx/planner_control_output", 10)
+        self.debug_output_publisher = self.create_publisher(String, "/cpx/debug_output", 10) if self.debug else None
+        input_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=2, reliability=ReliabilityPolicy.RELIABLE)
+        self.input_frame_publisher = self.create_publisher(PlannerInputFrame, "/cpx/planning/input_frame", input_qos)
         self.localization_subscription = self.create_subscription(Odometry, "/cpx/localization", lambda message: self._receive("localization", message), 10)
         self.perception_subscription = self.create_subscription(TrackedObjects, "/cpx/perception", lambda message: self._receive("perception", message), 10)
         self.v2x_subscription = self.create_subscription(TrackedObjects, "/cpx/v2x", lambda message: self._receive("v2x", message), 10)
-        self.cp_obstacles_subscription = self.create_subscription(String, "/cpx/cp_obstacles", lambda message: self._receive("cp_obstacles", message), 10)
+        self.cp_obstacles_subscription = self.create_subscription(TrackedObjects, "/cpx/cp_obstacles", lambda message: self._receive("cp_obstacles", message), 10)
         self.traffic_light_subscription = self.create_subscription(TrafficLightObservationArray, "/cpx/traffic_light", lambda message: self._receive("traffic_lights", message), 10)
         self.cooperative_subscription = self.create_subscription(CooperativeMessageArray, "/cpx/cooperative_messages", lambda message: self._receive("cooperative", message), 10)
         self.safety_status_subscription = self.create_subscription(String, "/cpx/safety_status", lambda message: self._receive("safety_status", message), 10)
         self.destination_subscription = self.create_subscription(PoseStamped, "/cpx/final_destination", lambda message: self._receive("final_destination", message), 10)
 
         self.planner_input_log_path = Path(str(self.get_parameter("planner_input_log_path").value)).expanduser().resolve()
-        self.planner_input_log_path.parent.mkdir(parents=True, exist_ok=True)
-        self.planner_input_log_path.write_text("", encoding="utf-8")
-        self.create_timer(0.02, self.run_planning_cycle)
-        self.get_logger().info("CP-X planner node loaded its local configuration and is waiting for ROS inputs.")
-
-    def _load_planner_configuration(self):
-        """Load the copied OpenCDA defaults from local ROS package YAML files."""
-        planner_payload = load_yaml_file(str(self.package_root / "config" / "planner.yaml"))
-        global_payload = load_yaml_file(str(self.package_root / "Global_Planner" / "global_planner.yaml"))
-        planner_config = dict(planner_payload.get("planner", planner_payload))
-        global_config = dict(global_payload.get("global_planner", global_payload))
-        planner_config = deep_merge_dicts(planner_config, global_config)
-        planner_config["mpc_config_path"] = str(self.package_root / "MPC" / "mpc.yaml")
-        planner_config["cp_message_path"] = ""
-        return planner_config
+        if self.debug:
+            self.planner_input_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.planner_input_log_path.write_text("", encoding="utf-8")
+        self.create_timer(float(self.get_parameter("planning_period_s").value), self.run_planning_cycle, callback_group=self._planning_callback_group)
+        self.get_logger().info("CP-X planner coordinator is waiting for ROS inputs at 20 Hz.")
 
     def _receive(self, input_name, message):
         """Forward each raw ROS message to the matching input-adapter method."""
@@ -155,33 +160,75 @@ class CPXPlannerNode(Node):
 
     def run_planning_cycle(self):
         """Run exactly one copied CP-X cycle for each synchronized ROS input frame."""
-        if self.input_adapter is None or not self.input_adapter.ready():
-            if not self._waiting_message_printed:
-                self.get_logger().info("Waiting for localization, perception, CP/V2X, traffic-light, safety, and destination data.")
-                self._waiting_message_printed = True
-            return
-        timestamp_s = float(self.input_adapter.latest_timestamp_s())
-        if timestamp_s == self._last_frame_timestamp_s:
-            return
-        try:
-            planner_output = self.planner_bridge.run_step()
-        except Exception as exc:
-            self.get_logger().error("Could not run the copied CP-X planning cycle: {}".format(exc))
-            return
-        adapter_output = self.planner_bridge.last_adapter_output
-        if adapter_output is None:
-            self.get_logger().error("The copied pipeline did not produce PlannerInputAdapterOutput.")
-            return
-        self._last_frame_timestamp_s = timestamp_s
-        self._waiting_message_printed = False
-        self.latest_adapter_output = adapter_output
-        self.latest_planner_output = planner_output
-        self.write_planner_input_adapter_output(adapter_output)
-        self.publish_debug_output(adapter_output, planner_output)
-        control_message = self.ros_output_adapter.build_control_message(planner_output=planner_output, stamp=_time_message(timestamp_s))
-        self.control_publisher.publish(control_message)
-        self.latest_control_message = control_message
-        self._log_cycle(adapter_output, planner_output)
+        with self._planning_lock:
+            if self.input_adapter is None or not self.input_adapter.ready():
+                if self.debug and not self._waiting_message_printed:
+                    self.get_logger().info("Waiting for localization, perception, CP/V2X, traffic-light, safety, and destination data.")
+                    self._waiting_message_printed = True
+                return
+            timestamp_s = float(self.input_adapter.latest_timestamp_s())
+            if timestamp_s == self._last_frame_timestamp_s:
+                return
+            planning_started_monotonic = time.perf_counter()
+            cycle_id = cycle_id_from_timestamp(timestamp_s)
+            self._set_component_cycle(cycle_id, timestamp_s)
+            try:
+                runtime_inputs = self.input_adapter.runtime_inputs()
+                ego_pose = dict(runtime_inputs["ego_pose"])
+                ego_location = PlannerLocation(x=float(ego_pose["x"]), y=float(ego_pose["y"]), z=float(ego_pose.get("z", 0.0)))
+                cp_payload = dict(runtime_inputs["cp_payload"] or {})
+                object_snapshots = self.planner_bridge._fused_planning_object_snapshots(local_object_snapshots=runtime_inputs["local_object_snapshots"], cp_obstacles=list(cp_payload.get("obstacles", []) or []), ego_location=ego_location, sim_time_s=timestamp_s)
+                adapter_output = self.input_adapter.build(ego_location=ego_location, ego_yaw_rad=float(ego_pose["heading_rad"]), ego_speed_mps=float(runtime_inputs["ego_speed_mps"]), object_snapshots=object_snapshots, cp_payload=cp_payload)
+                self._publish_input_frame(cycle_id, timestamp_s, adapter_output, runtime_inputs)
+                self.planner_bridge._prediction_lane_step_resolved_count = int(getattr(self.planner_bridge, "_prediction_lane_step_resolved_count", 0))
+                self.planner_bridge._prediction_lane_step_none_count = int(getattr(self.planner_bridge, "_prediction_lane_step_none_count", 0))
+                self.planner_bridge.input_adapter = DistributedInputAdapter(adapter_output, runtime_inputs)
+                planner_output = self.planner_bridge.run_step()
+            except Exception as exc:
+                self.get_logger().error("Could not run the copied CP-X planning cycle: {}".format(exc))
+                return
+            self._last_frame_timestamp_s = timestamp_s
+            self._waiting_message_printed = False
+            self.latest_adapter_output = adapter_output
+            self.latest_planner_output = planner_output
+            if self.debug:
+                self.write_planner_input_adapter_output(adapter_output)
+                self.publish_debug_output(adapter_output, planner_output)
+            control_message = self.ros_output_adapter.build_control_message(planner_output=planner_output, stamp=_time_message(timestamp_s))
+            planning_cycle_time_ms = (time.perf_counter() - planning_started_monotonic) * 1000.0
+            self.latest_planning_cycle_time_ms = float(planning_cycle_time_ms)
+            tcp_control_output = String()
+            tcp_control_output.data = json.dumps({"cycle_time_s": float(timestamp_s), "target_speed_mps": float(control_message.longitudinal.velocity), "acceleration_mps2": float(control_message.longitudinal.acceleration), "steering_rad": float(control_message.lateral.steering_tire_angle), "planning_cycle_time_ms": float(planning_cycle_time_ms)}, allow_nan=False, separators=(",", ":"))
+            self.tcp_control_output_publisher.publish(tcp_control_output)
+            self.control_publisher.publish(control_message)
+            self.latest_control_message = control_message
+            if self.debug:
+                self._log_cycle(adapter_output, planner_output)
+
+    def _set_component_cycle(self, cycle_id, timestamp_s):
+        """Give every component request the same simulation-cycle identity."""
+        for component in (self.global_planner, self.route_manager, self.mpc, self.behavior_context, self.behavior_decision):
+            component.active_cycle_id = int(cycle_id)
+            component.active_timestamp_s = float(timestamp_s)
+        self.global_planner.context_client.active_cycle_id = int(cycle_id)
+        self.global_planner.context_client.active_timestamp_s = float(timestamp_s)
+        self.global_planner.reference_client.active_cycle_id = int(cycle_id)
+        self.global_planner.reference_client.active_timestamp_s = float(timestamp_s)
+        self.reference_proxy.active_cycle_id = int(cycle_id)
+        self.reference_proxy.active_timestamp_s = float(timestamp_s)
+
+    def _publish_input_frame(self, cycle_id, timestamp_s, adapter_output, runtime_inputs):
+        """Publish the complete existing input contract once per 20 Hz cycle for recording."""
+        message = PlannerInputFrame()
+        fill_header(message.header, timestamp_s)
+        message.cycle_id = int(cycle_id)
+        message.sim_time_s = float(timestamp_s)
+        message.planner_input_adapter_output_json = encode_json(adapter_output)
+        message.runtime_inputs_json = encode_json(runtime_inputs)
+        message.metadata_json = encode_json({"v2x_nearby_count": int(runtime_inputs.get("v2x_nearby_count", 0) or 0), "prediction_lane_step_resolved_count": int(getattr(self.planner_bridge, "_prediction_lane_step_resolved_count", 0)), "prediction_lane_step_none_count": int(getattr(self.planner_bridge, "_prediction_lane_step_none_count", 0))})
+        if self.local_bus is not None:
+            self.local_bus.store_input_frame(message)
+        self.input_frame_publisher.publish(message)
 
     def publish_debug_output(self, adapter_output, planner_output):
         """Publish the complete input/output pair used for shadow comparison."""
@@ -222,7 +269,8 @@ class CPXPlannerNode(Node):
         }
         message = String()
         message.data = json.dumps(payload, allow_nan=False, separators=(",", ":"))
-        self.debug_output_publisher.publish(message)
+        if self.debug_output_publisher is not None:
+            self.debug_output_publisher.publish(message)
 
     def write_planner_input_adapter_output(self, adapter_output):
         """Append every field of the input contract without changing the planner."""
@@ -247,11 +295,14 @@ class CPXPlannerNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = CPXPlannerNode()
+    executor = MultiThreadedExecutor(num_threads=8)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
