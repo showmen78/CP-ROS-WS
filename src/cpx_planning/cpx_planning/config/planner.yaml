@@ -1,5 +1,3 @@
-# These are the default CP-X bridge and pipeline values from
-# new_opencda/opencda/scenario_testing/config_yaml/cpx_profile_full_default.yaml.
 planner:
   enabled: true
   type: cpx_mpc
@@ -10,28 +8,46 @@ planner:
   safety_max_steer_delta: 0.25
   safety_max_throttle_delta: 0.45
   safety_max_brake_delta: 0.6
-  road_boundary_projection_max_heading_step_rad: 0.04
-  road_boundary_projection_reset_distance_m: 2.5
-  road_boundary_carla_drivable_footprint_enabled: true
-  lane_change_target_lane_entry_min_progress: 0.5
-  lane_change_stabilization_duration_s: 2.5
-  lane_change_stabilization_speed_mps: 1.5
-  lane_change_stabilization_timeout_frames: 100
-  reference_vehicle_half_width_m: 1.07
-  reference_vehicle_half_length_m: 2.45
-  turn_swept_footprint_correction_padding_m: 0.05
-  carla_reference_boundary_aware: true
-  carla_reference_tracking_reserve_m: 0.2
-  control_buffer_max_reference_anchor_jump_m: 0.75
-  lane_change_completion_footprint_margin_m: 0.05
+  safety_stuck_release_min_accel_mps2: 0.01
+  use_opencda_global_route: true
+  opencda_global_route_reference_allowed: true
+  global_planner_xodr_path: Global_Planner/maps/Town06.xodr
   publish_cp_message: true
   require_native_opencda_cp: true
-  target_speed_mps: 10.0
+  target_speed_mps: 12.0
+  ignore_traffic_control: true
+  velocity_steering_interface_enabled: true
+  velocity_adapter_kp: 0.18
+  velocity_adapter_ki: 0.025
+  velocity_adapter_cruise_feedforward: 0.28
+  velocity_adapter_speed_deadband_mps: 0.12
+  velocity_adapter_brake_activation_error_mps: 0.35
+  velocity_adapter_max_throttle: 0.85
+  velocity_adapter_max_tracking_brake: 0.1
+  velocity_adapter_max_stop_brake: 0.35
+  velocity_adapter_max_steering_rate_deg_s: 25.0
+  velocity_adapter_stop_steering_decay_rate_deg_s: 4.0
+  velocity_adapter_emergency_steering_decay_rate_deg_s: 25.0
+  actuator_compensation_enabled: true
+  actuator_cruise_throttle_feedforward: 0.28
+  actuator_cruise_max_throttle: 0.85
+  actuator_speed_error_throttle_gain: 0.05
+  actuator_max_speed_error_throttle_boost: 0.2
+  actuator_speed_deadband_mps: 0.15
+  actuator_tracking_brake_decel_per_unit_mps2: 14.0
+  actuator_stop_brake_decel_per_unit_mps2: 10.0
+  actuator_tracking_max_brake: 0.22
+  actuator_stop_max_brake: 0.35
+  actuator_max_measured_accel_abs_mps2: 3.0
+  control_buffer_speed_crossing_deadband_mps: 0.15
+  turn_drivable_union_seam_max_pose_violations: 3
+  turn_drivable_union_seam_max_violation_ratio: 0.1
+  actuator_measured_accel_alpha: 0.25
   lookahead_m: 18.0
   min_front_gap_m: 8.0
-  communication_range_m: 80.0
+  communication_range_m: 60.0
   max_mpc_obstacles: 4
-  route_reached_distance_m: 3.0
+  route_reached_distance_m: 1.0
   tracker_max_stale_s: 0.5
   tracker_max_speed_mps: 45.0
   tracker_max_acceleration_mps2: 12.0
@@ -42,20 +58,32 @@ planner:
   mpc_feedback_candidate_weight: 80.0
   control_buffer_enabled: true
   control_buffer_max_reuse_s: 0.35
-  opencda_style_reference_conditioning_enabled: false
-  lane_follow_speed_recovery_enabled: false
-  lane_follow_negative_accel_release_enabled: false
-  overspeed_guard_enabled: true
+  overspeed_guard_enabled: false
   overspeed_margin_mps: 0.5
-  overspeed_min_brake: 0.2
-  overspeed_max_brake: 0.65
-  low_speed_lateral_recovery_enabled: true
+  overspeed_release_margin_mps: 0.1
+  overspeed_decel_gain: 0.8
+  overspeed_max_decel_mps2: 0.8
+  lane_follow_negative_accel_release_enabled: false
+  lane_follow_negative_accel_release_error_mps: 0.05
+  lane_follow_negative_accel_release_min_front_gap_m: 12.0
+  full_traffic_green_confirm_s: 0.15
+  full_traffic_hold_stop_unknown_until_green: false
+  full_stop_hold_speed_mps: 0.1
+  full_stop_hold_brake: 0.6
+  normal_stop_mpc_suspend_speed_mps: 0.3
+  normal_stop_mpc_suspend_brake: 0.08
+  lane_follow_speed_recovery_enabled: false
+  lane_follow_speed_recovery_enter_error_mps: 0.2
+  lane_follow_speed_recovery_release_error_mps: 0.05
+  lane_follow_speed_recovery_min_accel_mps2: 0.8
+  lane_follow_speed_recovery_max_lateral_m: 0.5
+  low_speed_lateral_recovery_enabled: false
   low_speed_lateral_recovery_speed_mps: 0.8
   low_speed_lateral_recovery_threshold_m: 1.2
   low_speed_lateral_recovery_target_speed_mps: 1.0
   low_speed_lateral_recovery_max_steer_rad: 0.18
   full_lane_change_start_lock_s: 8.0
-  full_dense_traffic_lane_change_lock_enabled: true
+  full_dense_traffic_lane_change_lock_enabled: false
   full_dense_traffic_object_count: 8
   full_dense_traffic_risky_lane_count: 2
   full_prepare_lane_change_reference_lock: true
@@ -70,14 +98,76 @@ planner:
   full_stop_max_reference_first_lateral_m: 0.55
   full_stop_guard_destination_forward_m: 6.0
   full_mpc_reference_stabilizer_enabled: true
+  full_candidate_pipeline_enabled: true
+  human_like_lane_change_enabled: true
+  human_lane_change_min_duration_s: 3.0
+  human_lane_change_max_duration_s: 6.5
+  route_tracking_baseline_enabled: false
+  route_tracking_rejoin_distance_m: 7.0
+  route_tracking_destination_arc_m: 8.0
+  route_tracking_destination_horizon_fraction: 0.9
+  route_tracking_min_step_m: 0.1
+  route_tracking_lane_change_duration_s: 4.0
+  route_tracking_lane_change_direct_target_tracking_enabled: false
+  route_tracking_lane_change_road_envelope_enabled: false
+  route_tracking_lane_change_duration_comfort_check_enabled: true
+  route_tracking_recovery_heading_error_deg: 25.0
+  route_tracking_recovery_speed_mps: 1.0
+  route_tracking_recovery_rejoin_distance_m: 10.0
+  route_tracking_lane_change_max_curvature_1pm: 0.35
+  route_tracking_lane_change_max_heading_jump_rad: 0.35
+  route_tracking_lane_change_max_lane_center_fraction: 0.7
+  route_tracking_lane_change_max_boundary_failures: 1
+  full_lane_change_reference_duplicate_spacing_m: 0.05
+  route_tracking_turn_activation_distance_m: 18.0
+  route_tracking_obstacle_additional_buffer_m: 3.0
+  full_candidate_reference_min_object_distance_m: 2.0
+  candidate_lane_change_defer_cost: 10.0
+  full_intersection_turn_prepare_enabled: true
+  full_intersection_turn_prepare_lookahead_m: 22.0
+  full_intersection_turn_prepare_min_m: 3.0
+  full_intersection_turn_speed_cap_mps: 5.0
+  full_intersection_turn_prepare_speed_cap_mps: 5.0
+  turn_approach_comfort_decel_mps2: 2.5
+  turn_approach_entry_buffer_m: 5.0
+  turn_approach_preview_margin_m: 10.0
+  full_lane_change_speed_cap_mps: 6.0
+  carla_waypoint_turn_speed_cap_mps: 2.2
+  carla_waypoint_turn_min_step_m: 0.35
+  carla_waypoint_turn_connector_distance_m: 7.0
+  carla_waypoint_turn_anchor_to_ego_heading: false
+  carla_waypoint_turn_destination_arc_m: 4.5
+  carla_turn_connector_smoothing_passes: 16
+  reference_contract_intersection_turn_max_curvature_1pm: 0.55
+  reference_contract_turn_vehicle_footprint_enabled: true
+  reference_contract_turn_boundary_margin_m: 0.15
+  reference_contract_turn_max_boundary_failures: 1
+  road_boundary_projection_max_heading_step_rad: 0.04
+  road_boundary_projection_reset_distance_m: 2.5
+  road_boundary_carla_drivable_footprint_enabled: true
+  lane_change_target_lane_entry_min_progress: 0.5
+  lane_change_stabilization_duration_s: 2.5
+  lane_change_stabilization_speed_mps: 1.5
+  lane_change_stabilization_timeout_frames: 100
+  reference_vehicle_half_width_m: 1.07
+  reference_vehicle_half_length_m: 2.45
+  turn_swept_footprint_correction_padding_m: 0.05
+  carla_reference_boundary_aware: true
+  carla_reference_tracking_reserve_m: 0.2
+  control_buffer_max_reference_anchor_jump_m: 0.75
+  lane_change_completion_footprint_margin_m: 0.05
+  lane_change_completion_max_lateral_error_m: 0.2
+  lane_change_completion_max_heading_error_deg: 5.0
+  scenario_turn_exit_hold_s: 3.0
+  scenario_turn_exit_max_heading_error_rad: 0.15
+  scenario_turn_exit_max_lateral_m: 0.75
+  scenario_turn_exit_heading_lookahead_m: 5.0
   full_reference_stabilizer_min_forward_m: -0.25
   full_reference_stabilizer_min_spacing_m: 0.35
   full_reference_stabilizer_max_heading_step_rad: 0.75
   full_stop_reference_buffer_m: 1.5
   full_stop_reference_decel_mps2: 2.0
   full_stop_reference_speed_cap_mps: 2.0
-  normal_stop_mpc_suspend_speed_mps: 0.3
-  normal_stop_mpc_suspend_brake: 0.08
   reference_contract_lane_follow_min_first_forward_m: 0.5
   reference_contract_lane_follow_max_first_lateral_abs_m: 0.75
   reference_contract_lane_follow_max_destination_lane_error_m: 0.75
@@ -88,5 +178,8 @@ planner:
   reference_contract_stop_max_destination_body_lateral_abs_m: 1.5
   opencda_reference_recovery_speed_mps: 1.2
   record_debug: true
-  debug_output_dir: opencda/planning_module/opencda_bridge/debug_cpx_default
+  record_evaluation_metrics: true
+  record_collision_sensor: true
   debug: true
+  global_planner_mode: dij
+  global_planner_strict: true

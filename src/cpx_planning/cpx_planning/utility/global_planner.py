@@ -50,6 +50,7 @@ class RoutePlanSummary:
     route_waypoints: List[List[float]]
     road_options: List[str] = field(default_factory=list)
     current_road_option: str = "LANEFOLLOW"
+    next_macro_distance_m: float = float("inf")
     debug_reason: str = ""
     start_graph_index: int = -1
     goal_graph_index: int = -1
@@ -209,6 +210,33 @@ def _point_dict(point: Mapping[str, object] | Sequence[object]) -> Dict[str, flo
     raise TypeError("Planner points must be mappings or numeric sequences.")
 
 
+def _admap_canonical_lane_waypoints(waypoint) -> List[object]:
+    """Return the same-direction cross-section containing `waypoint`.
+
+    Mirrors `carla_lane_graph.canonical_lane_waypoints`, but walks this
+    adapter's `Waypoint.left()`/`.right()` (Global_Planner/global_planner/
+    waypoint.py) rather than CARLA's `get_left_lane()`/`get_right_lane()`,
+    which this waypoint type does not implement.
+    """
+    if waypoint is None:
+        return []
+    rightmost = waypoint
+    while True:
+        right = rightmost.right()
+        if right is None:
+            break
+        rightmost = right
+    lanes: List[object] = [rightmost]
+    current = rightmost
+    while True:
+        left = current.left()
+        if left is None:
+            break
+        lanes.append(left)
+        current = left
+    return lanes
+
+
 class CustomGlobalPlannerAdapter:
     """Expose custom routing through the planning module's existing summary API."""
 
@@ -236,6 +264,7 @@ class CustomGlobalPlannerAdapter:
         self._query_indices: Dict[str, int] = {}
         self._lane_context_lock = threading.Lock()
         self._lane_context_cache: Tuple[float, float, float, Dict[str, object]] | None = None
+        self._local_lane_graph_cache: Tuple[float, float, float, int, Dict[str, object]] | None = None
 
     @property
     def blocked_lanes(self) -> List[int]:
@@ -257,6 +286,18 @@ class CustomGlobalPlannerAdapter:
             _point_dict(position),
             search_radius_m=search_radius_m,
         )
+
+    def get_waypoint_candidates(
+        self,
+        position: Mapping[str, object] | Sequence[object],
+        search_radius_m: float | None = None,
+    ) -> List[Dict[str, object]]:
+        """Expose nearby AD-map projections without selecting a lane."""
+
+        return list(self.core.get_waypoint_candidates(
+            _point_dict(position),
+            search_radius_m=search_radius_m,
+        ))
 
     @staticmethod
     def world_heading_rad(waypoint: Waypoint | None) -> float | None:
@@ -388,6 +429,7 @@ class CustomGlobalPlannerAdapter:
                 "section_id": -1,
                 "direction": "unknown",
                 "lane_id": INVALID_LANE_ID,
+                "display_lane_index": INVALID_LANE_ID,
                 "lane_ids": [],
                 "lane_count": 0,
                 "min_lane_id": INVALID_LANE_ID,
@@ -401,22 +443,45 @@ class CustomGlobalPlannerAdapter:
                 "opendrive_lane_id": 0,
             }
         else:
-            lanes = canonical_lane_waypoints(waypoint)
-            lane_ids = list(range(1, len(lanes) + 1))
-            lane_id = canonical_lane_id_for_waypoint(waypoint)
-            lane_index = lane_id - 1
+            # `canonical_lane_waypoints`/`canonical_lane_id_for_waypoint` walk
+            # CARLA's `get_left_lane()`/`get_right_lane()` API. This adapter's
+            # `Waypoint` exposes `.left()`/`.right()` instead (see
+            # Global_Planner/global_planner/waypoint.py), so those two calls
+            # silently no-op into a one-element list here -- `lane_id` was
+            # always 1 and `can_change_left`/`can_change_right` were always
+            # False, regardless of actual position. `waypoint.ad_lane_id` is
+            # AD-map's own persistent cross-road-segment lane id (see
+            # admap_backend.get_opendrive_lane_info), so it is used directly
+            # as `lane_id` instead of a recomputed positional count, and
+            # left/right eligibility is read from the real adjacency graph
+            # AD-map already built (`Waypoint.left()`/`.right()`, backed by
+            # `GlobalPlanner._lane_cache`'s `left_lane_id`/`right_lane_id`).
+            # The old positional count is kept, renamed, as `display_lane_index`
+            # for HUD-style numbering -- it must never be used as an identity
+            # or adjacency key, only for display.
+            lanes = _admap_canonical_lane_waypoints(waypoint)
+            lane_ids = [int(lane.ad_lane_id) for lane in lanes]
+            display_lane_index = next(
+                (
+                    index + 1
+                    for index, lane in enumerate(lanes)
+                    if int(lane.ad_lane_id) == int(waypoint.ad_lane_id)
+                ),
+                INVALID_LANE_ID,
+            )
             result = {
                 "road_id": f"{int(waypoint.road_id or 0)}:{int(waypoint.section_id or 0)}",
                 "road_numeric_id": int(waypoint.road_id or 0),
                 "section_id": int(waypoint.section_id or 0),
                 "direction": "positive" if int(waypoint.lane_id or 0) > 0 else "negative",
-                "lane_id": int(lane_id),
+                "lane_id": int(waypoint.ad_lane_id),
+                "display_lane_index": int(display_lane_index),
                 "lane_ids": lane_ids,
                 "lane_count": len(lane_ids),
                 "min_lane_id": min(lane_ids, default=INVALID_LANE_ID),
                 "max_lane_id": max(lane_ids, default=INVALID_LANE_ID),
-                "can_change_left": 0 <= lane_index < len(lanes) - 1,
-                "can_change_right": lane_index > 0,
+                "can_change_left": waypoint.left() is not None,
+                "can_change_right": waypoint.right() is not None,
                 "heading_rad": world_heading_rad(waypoint),
                 "is_intersection": bool(waypoint.is_intersection),
                 "lane_width_m": float(waypoint.lane_width_m or 3.5),
@@ -426,6 +491,207 @@ class CustomGlobalPlannerAdapter:
         with self._lane_context_lock:
             self._lane_context_cache = (float(x_m), float(y_m), query_z, dict(result))
         return result
+
+    def get_local_lane_graph(
+        self,
+        x_m: float,
+        y_m: float,
+        *,
+        z_m: float = 0.0,
+        forward_distance_m: float = 100.0,
+        backward_distance_m: float = 100.0,
+        sample_step_m: float = 5.0,
+        ego_waypoint: Waypoint | None = None,
+    ) -> Dict[str, object]:
+        """Build a sliding AD-map lane graph around the ego position.
+
+        Corridor keys are signed lateral offsets from ego: left ``+1``,
+        current ``0``, right ``-1``.  Each corridor contains every AD lane
+        segment reachable longitudinally inside the configured window, so a
+        target remains classifiable after road/section ids change.
+        """
+
+        ego = ego_waypoint or self.get_waypoint({"x": x_m, "y": y_m, "z": z_m})
+        requested_lane_id = int(getattr(ego, "ad_lane_id", 0) or 0)
+        cached = getattr(self, "_local_lane_graph_cache", None)
+        if (
+            cached is not None
+            and len(cached) == 5
+            and _distance_3d((x_m, y_m, z_m), cached[:3]) < 2.0
+            and int(cached[3]) == int(requested_lane_id)
+        ):
+            result = dict(cached[4])
+            result["cache_reused"] = True
+            result["generation_reason"] = "position_within_2m_same_matched_lane"
+            return result
+        if ego is None:
+            result = {
+                "ego_ad_lane_id": 0,
+                "forward_distance_m": float(forward_distance_m),
+                "backward_distance_m": float(backward_distance_m),
+                "corridors": {},
+                "lane_to_offset": {},
+                "cache_reused": False,
+                "generation_reason": "no_matched_hd_map_lane",
+            }
+            self._local_lane_graph_cache = (
+                float(x_m), float(y_m), float(z_m), 0, dict(result)
+            )
+            return result
+
+        seeds = {0: ego, 1: ego.left(), -1: ego.right()}
+        corridors: Dict[int, list[int]] = {}
+        lane_to_offset: Dict[int, int] = {}
+        step = max(1.0, float(sample_step_m))
+        for offset, seed in seeds.items():
+            if seed is None:
+                continue
+            lane_ids = {int(seed.ad_lane_id)}
+            for distance_limit, forward in (
+                (max(0.0, float(forward_distance_m)), True),
+                (max(0.0, float(backward_distance_m)), False),
+            ):
+                distance = step
+                while distance <= distance_limit + 1.0e-6:
+                    reached = seed.next(distance) if forward else seed.previous(distance)
+                    lane_ids.update(int(candidate.ad_lane_id) for candidate in reached)
+                    distance += step
+            ordered = sorted(lane_ids)
+            corridors[int(offset)] = ordered
+            for lane_id in ordered:
+                # Direct lateral corridors take priority over a branch that
+                # is also reachable from the current lane at an intersection.
+                if lane_id not in lane_to_offset or int(offset) != 0:
+                    lane_to_offset[int(lane_id)] = int(offset)
+        self._merge_stored_route_into_local_lane_graph(
+            x_m=float(x_m),
+            y_m=float(y_m),
+            forward_distance_m=float(forward_distance_m),
+            backward_distance_m=float(backward_distance_m),
+            corridors=corridors,
+            lane_to_offset=lane_to_offset,
+        )
+        corridors = {
+            int(offset): sorted({int(lane_id) for lane_id in lane_ids})
+            for offset, lane_ids in corridors.items()
+        }
+        result = {
+            "ego_ad_lane_id": int(ego.ad_lane_id),
+            "forward_distance_m": float(forward_distance_m),
+            "backward_distance_m": float(backward_distance_m),
+            "corridors": corridors,
+            "lane_to_offset": lane_to_offset,
+            "cache_reused": False,
+            "generation_reason": "rebuilt_from_matched_hd_map_lane",
+        }
+        self._local_lane_graph_cache = (
+            float(x_m), float(y_m), float(z_m), int(ego.ad_lane_id), dict(result)
+        )
+        return result
+
+    def _merge_stored_route_into_local_lane_graph(
+        self,
+        *,
+        x_m: float,
+        y_m: float,
+        forward_distance_m: float,
+        backward_distance_m: float,
+        corridors: Dict[int, list[int]],
+        lane_to_offset: Dict[int, int],
+    ) -> None:
+        """Extend the local frame through route-owned connector geometry.
+
+        AD-map longitudinal stepping can stop at a junction contact even when
+        the stored route proves which successor connector/outgoing lane is in
+        use.  Walk only the +/-100 m stored-route window and propagate signed
+        lateral offset from real waypoint adjacency: longitudinal transitions
+        preserve offset, while left/right contacts change it by +/-1.
+        """
+
+        if (
+            self._stored_route_xy is None
+            or self._stored_route_cum_dists is None
+            or not self._stored_route_waypoints
+        ):
+            return
+        count = min(
+            len(self._stored_route_xy),
+            len(self._stored_route_cum_dists),
+            len(self._stored_route_waypoints),
+        )
+        if count <= 0:
+            return
+        # Reuse the monotonic route-progress tracker instead of independently
+        # projecting over the entire polyline.  At loops or close parallel
+        # segments, a global nearest-point query can otherwise jump to a
+        # future route section and inject the wrong lanes into this frame.
+        anchor = self._nearest_stored_route_index(
+            float(x_m), float(y_m), "local_lane_graph"
+        )
+        anchor = min(max(0, int(anchor)), count - 1)
+        anchor_wp = self._stored_route_waypoints[anchor]
+        if anchor_wp is None:
+            return
+        anchor_lane_id = int(anchor_wp.ad_lane_id)
+        anchor_offset = int(lane_to_offset.get(anchor_lane_id, 0))
+
+        def add_waypoint(waypoint: Waypoint | None, offset: int) -> None:
+            if waypoint is None or abs(int(offset)) > 1:
+                return
+            lane_id = int(waypoint.ad_lane_id)
+            corridors.setdefault(int(offset), []).append(lane_id)
+            lane_to_offset.setdefault(lane_id, int(offset))
+            for adjacent, adjacent_offset in (
+                (waypoint.left(), int(offset) + 1),
+                (waypoint.right(), int(offset) - 1),
+            ):
+                if adjacent is None or abs(int(adjacent_offset)) > 1:
+                    continue
+                adjacent_id = int(adjacent.ad_lane_id)
+                corridors.setdefault(int(adjacent_offset), []).append(adjacent_id)
+                lane_to_offset.setdefault(adjacent_id, int(adjacent_offset))
+
+        def lateral_delta(current: Waypoint, following: Waypoint) -> int:
+            if int(current.ad_lane_id) == int(following.ad_lane_id):
+                return 0
+            left = current.left()
+            if left is not None and int(left.ad_lane_id) == int(following.ad_lane_id):
+                return 1
+            right = current.right()
+            if right is not None and int(right.ad_lane_id) == int(following.ad_lane_id):
+                return -1
+            return 0
+
+        add_waypoint(anchor_wp, anchor_offset)
+        offset = int(anchor_offset)
+        for index in range(anchor, count - 1):
+            if (
+                float(self._stored_route_cum_dists[index + 1])
+                - float(self._stored_route_cum_dists[anchor])
+                > max(0.0, float(forward_distance_m))
+            ):
+                break
+            current = self._stored_route_waypoints[index]
+            following = self._stored_route_waypoints[index + 1]
+            if current is None or following is None:
+                continue
+            offset += lateral_delta(current, following)
+            add_waypoint(following, offset)
+
+        offset = int(anchor_offset)
+        for index in range(anchor, 0, -1):
+            if (
+                float(self._stored_route_cum_dists[anchor])
+                - float(self._stored_route_cum_dists[index - 1])
+                > max(0.0, float(backward_distance_m))
+            ):
+                break
+            previous = self._stored_route_waypoints[index - 1]
+            current = self._stored_route_waypoints[index]
+            if previous is None or current is None:
+                continue
+            offset -= lateral_delta(previous, current)
+            add_waypoint(previous, offset)
 
     def get_current_route_info(
         self,
@@ -444,12 +710,14 @@ class CustomGlobalPlannerAdapter:
         current_option = self._stored_route_options[index] if self._stored_route_options else "LANEFOLLOW"
         next_maneuver = self._next_macro_maneuver(self._stored_route_options, index)
         optimal_lane = self._optimal_lane_from_index(index)
+        next_macro_distance = self._next_macro_distance_from_index(index)
         return replace(
             self._stored_route_summary,
             optimal_lane_id=int(optimal_lane),
             distance_to_destination_m=max(0.0, remaining),
             next_macro_maneuver=next_maneuver,
             current_road_option=current_option,
+            next_macro_distance_m=float(next_macro_distance),
         )
 
     def _summary_from_route(self, route: Route) -> RoutePlanSummary:
@@ -474,7 +742,7 @@ class CustomGlobalPlannerAdapter:
         start_wp = waypoints[0]
         goal_wp = waypoints[-1]
         lane_ids = [canonical_lane_id_for_waypoint(wp) for wp in waypoints]
-        options = self._geometric_road_options(points)
+        options = self._lane_aware_road_options(points, waypoints)
         summary = RoutePlanSummary(
             route_found=True,
             start_road_id=self._road_key(start_wp),
@@ -512,24 +780,128 @@ class CustomGlobalPlannerAdapter:
             or [canonical_lane_id_for_waypoint(wp) for wp in self._stored_route_waypoints]
         )
         self._query_indices.clear()
+        # The graph cache contains lane identities from the stored route, so a
+        # route replacement/replan invalidates it even if ego moved <2 m.
+        self._local_lane_graph_cache = None
 
     def _nearest_stored_route_index(self, x_m: float, y_m: float, query_key: str) -> int:
         assert self._stored_route_xy is not None
-        start_index = max(0, int(self._query_indices.get(str(query_key), 0)) - 5)
-        candidate_xy = self._stored_route_xy[start_index:]
+        key = str(query_key)
+        previous_index = self._query_indices.get(key)
+        if previous_index is None:
+            # A new consumer may first query after spawn/replan, so its first
+            # projection must be allowed to initialize anywhere on the route.
+            start_index = 0
+            end_index = len(self._stored_route_xy)
+        else:
+            previous_index = min(
+                max(0, int(previous_index)),
+                len(self._stored_route_xy) - 1,
+            )
+            start_index = max(0, previous_index - 5)
+            # Do not search the entire future polyline on every tick.  Loops
+            # and close parallel segments can be spatially nearer while being
+            # hundreds of route metres ahead, which previously skipped
+            # required turns/lane changes.  Route replacement clears query
+            # state, so a 50 m forward reacquisition window is ample for
+            # normal motion without permitting a topological teleport.
+            if self._stored_route_cum_dists is not None:
+                forward_limit_m = (
+                    float(self._stored_route_cum_dists[previous_index]) + 50.0
+                )
+                end_index = int(
+                    np.searchsorted(
+                        self._stored_route_cum_dists,
+                        forward_limit_m,
+                        side="right",
+                    )
+                )
+                end_index = min(
+                    len(self._stored_route_xy),
+                    max(previous_index + 1, end_index),
+                )
+            else:
+                end_index = min(
+                    len(self._stored_route_xy),
+                    previous_index + 51,
+                )
+        candidate_xy = self._stored_route_xy[start_index:end_index]
         distances_sq = (
             (candidate_xy[:, 0] - float(x_m)) ** 2
             + (candidate_xy[:, 1] - float(y_m)) ** 2
         )
         index = start_index + int(np.argmin(distances_sq))
-        self._query_indices[str(query_key)] = index
+        if previous_index is not None:
+            index = max(int(previous_index), int(index))
+        self._query_indices[key] = index
         return index
 
     def _optimal_lane_from_index(self, index: int) -> int:
-        for lane_id in self._stored_route_lane_ids[index:]:
-            if int(lane_id) != INVALID_LANE_ID:
-                return int(lane_id)
-        return INVALID_LANE_ID
+        start = max(0, int(index))
+        current_lane_id = (
+            int(self._stored_route_lane_ids[start])
+            if start < len(self._stored_route_lane_ids)
+            else INVALID_LANE_ID
+        )
+        current_option = (
+            str(self._stored_route_options[start]).upper().replace("_", "")
+            if start < len(self._stored_route_options)
+            else ""
+        )
+        if current_option in {"LEFT", "RIGHT", "STRAIGHT"}:
+            # Once progress is inside a connector, expose that connector's
+            # local exit identity, but never scan beyond the contiguous turn
+            # block into a later lane-change maneuver.
+            resolved = int(current_lane_id)
+            for turn_index in range(
+                start,
+                min(len(self._stored_route_options), len(self._stored_route_lane_ids)),
+            ):
+                option = str(self._stored_route_options[turn_index]).upper().replace("_", "")
+                if option != current_option:
+                    break
+                lane_id = int(self._stored_route_lane_ids[turn_index])
+                if lane_id != INVALID_LANE_ID:
+                    resolved = int(lane_id)
+            return int(resolved)
+        # ``optimal_lane_id`` and ``next_macro_maneuver`` must describe the
+        # same immediate route event.  Scanning the whole remaining route for
+        # any later lane change used to expose a post-intersection target while
+        # the next event was still a turn.  That remote AD lane cannot belong
+        # to the ego-centred +/-100 m local frame and caused route/behavior to
+        # infer a direction before the physical target corridor even existed.
+        option_index = self._next_macro_index(self._stored_route_options, start)
+        if option_index is None:
+            return int(current_lane_id)
+        option = str(self._stored_route_options[option_index]).upper().replace("_", "")
+        if option not in {"CHANGELANELEFT", "CHANGELANERIGHT"}:
+            return int(current_lane_id)
+        search_end = min(len(self._stored_route_waypoints) - 1, option_index + 16)
+        for transition_index in range(option_index, search_end):
+            current = self._stored_route_waypoints[transition_index]
+            following = self._stored_route_waypoints[transition_index + 1]
+            if current is None or following is None:
+                continue
+            adjacent = current.left() if option == "CHANGELANELEFT" else current.right()
+            if adjacent is not None and int(adjacent.ad_lane_id) == int(following.ad_lane_id):
+                return int(following.ad_lane_id)
+        # Failure to prove the adjacent transition is not permission to pick
+        # an arbitrary farther route lane. Keep the current semantic identity
+        # and let authorization report that no local target is available.
+        return int(current_lane_id)
+
+    def _next_macro_distance_from_index(self, index: int) -> float:
+        if self._stored_route_cum_dists is None:
+            return float("inf")
+        start = min(max(0, int(index)), len(self._stored_route_cum_dists) - 1)
+        option_index = self._next_macro_index(self._stored_route_options, start)
+        if option_index is not None:
+            return max(
+                0.0,
+                float(self._stored_route_cum_dists[option_index])
+                - float(self._stored_route_cum_dists[start]),
+            )
+        return float("inf")
 
     @staticmethod
     def _road_key(waypoint: Waypoint | None) -> str:
@@ -577,13 +949,72 @@ class CustomGlobalPlannerAdapter:
                 options[nearby] = option
         return options
 
+    @classmethod
+    def _lane_aware_road_options(
+        cls,
+        points: Sequence[Sequence[float]],
+        waypoints: Sequence[Waypoint | None],
+    ) -> List[str]:
+        options = cls._geometric_road_options(points)
+        for index, (current, following) in enumerate(zip(waypoints, waypoints[1:])):
+            if current is None or following is None:
+                continue
+            if int(current.ad_lane_id) == int(following.ad_lane_id):
+                continue
+            left = current.left()
+            right = current.right()
+            if left is not None and int(left.ad_lane_id) == int(following.ad_lane_id):
+                option = "CHANGELANELEFT"
+            elif right is not None and int(right.ad_lane_id) == int(following.ad_lane_id):
+                option = "CHANGELANERIGHT"
+            else:
+                continue
+            # The sampled lateral connector itself has large heading changes,
+            # so the geometric classifier labels several points around it as
+            # LEFT/RIGHT/STRAIGHT.  Mark the whole local connector window as
+            # one lane-change maneuver; otherwise that geometric noise masks
+            # the graph transition when looking for the next macro action.
+            for nearby in range(max(0, index - 6), min(len(options), index + 7)):
+                options[nearby] = option
+        return options
+
     @staticmethod
     def _next_macro_maneuver(options: Sequence[str], start_index: int) -> str:
-        labels = {"LEFT": "Turn Left", "RIGHT": "Turn Right", "STRAIGHT": "Continue Straight"}
-        for option in options[max(0, int(start_index)):]:
-            if str(option).upper() in labels:
-                return labels[str(option).upper()]
+        labels = {
+            "LEFT": "Turn Left",
+            "RIGHT": "Turn Right",
+            "STRAIGHT": "Continue Straight",
+            "CHANGELANELEFT": "Lane Change Left",
+            "CHANGELANERIGHT": "Lane Change Right",
+        }
+        index = CustomGlobalPlannerAdapter._next_macro_index(options, start_index)
+        if index is not None:
+            option = str(options[index]).upper().replace("_", "")
+            if option in labels:
+                return labels[option]
         return "Continue Straight"
+
+    @staticmethod
+    def _next_macro_index(options: Sequence[str], start_index: int) -> int | None:
+        normalized = [str(option).upper().replace("_", "") for option in options]
+        macro = {"LEFT", "RIGHT", "STRAIGHT", "CHANGELANELEFT", "CHANGELANERIGHT"}
+        start = max(0, int(start_index))
+        for index in range(start, len(normalized)):
+            option = normalized[index]
+            if option not in macro:
+                continue
+            if option == "STRAIGHT":
+                # A geometric STRAIGHT label immediately before a decisive
+                # turn is normally the entry connector, not the route's
+                # intended maneuver.  Prefer the nearby decisive graph/turn
+                # label so PREPARE_TURN does not latch the wrong direction.
+                for decisive_index in range(index + 1, min(len(normalized), index + 13)):
+                    if normalized[decisive_index] in {
+                        "LEFT", "RIGHT", "CHANGELANELEFT", "CHANGELANERIGHT"
+                    }:
+                        return int(decisive_index)
+            return int(index)
+        return None
 
     def _failure_summary(
         self,

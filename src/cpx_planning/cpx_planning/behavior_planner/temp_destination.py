@@ -2072,7 +2072,10 @@ def _build_reference_samples_impl(
         ego_wp,
         horizon_steps=n,
         step_distance_m=sd,
-        route_points=None,
+        # Route points select the longitudinal successor at a fork; because
+        # ``use_route_reference`` is false in this path, output geometry still
+        # comes from CARLA lane-center waypoints rather than route XY samples.
+        route_points=route_points_valid,
         fallback_lane_id=int(current_lane_id),
         maneuver=walk_maneuver,
     )
@@ -2080,7 +2083,7 @@ def _build_reference_samples_impl(
         start_wp,
         horizon_steps=n,
         step_distance_m=sd,
-        route_points=None,
+        route_points=route_points_valid,
         fallback_lane_id=int(target_lane_id),
         maneuver=walk_maneuver,
     )

@@ -186,6 +186,7 @@ class FinalReferenceGate:
         if bool(stop_goal_active) or behavior in {
             "stop_at_intersection",
             "stop_sign",
+            "static_obstacle_stop",
         }:
             return "stop"
         if (

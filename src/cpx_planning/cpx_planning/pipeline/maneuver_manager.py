@@ -65,6 +65,46 @@ class ManeuverManager:
         self.active_plan = None
         self._last_output = []
 
+    def retained_turn_continuation(
+        self,
+        *,
+        ego_x_m: float,
+        ego_y_m: float,
+        target_speed_mps: float,
+        count: int,
+    ) -> list[dict[str, object]]:
+        """Return the forward part of the currently owned turn geometry.
+
+        ScenarioManager intentionally keeps the turn authoritative during
+        TURN_EXIT_STABILIZATION.  Candidate generation can nevertheless have
+        a one-frame map/footprint contract miss after the route has advanced.
+        The already accepted maneuver geometry is the continuous reference
+        for that transient; rebuilding a fresh route or emergency-stop path
+        here changes ownership and produces a control spike.
+        """
+
+        plan = self.active_plan
+        if plan is None or str(plan.maneuver_type) != "intersection_turn":
+            return []
+        retained, retained_index = self._forward_window(
+            plan.geometry,
+            ego_x_m=float(ego_x_m),
+            ego_y_m=float(ego_y_m),
+            count=max(2, int(count)),
+            start_index=int(plan.progress_index),
+        )
+        if not retained:
+            return []
+        plan.progress_index = max(int(plan.progress_index), int(retained_index))
+        result = self._apply_velocity_profile(
+            retained,
+            [
+                {"speed_ref_mps": float(target_speed_mps)}
+                for _ in retained
+            ],
+        )
+        return [dict(sample) for sample in result]
+
     def update(
         self,
         *,
@@ -80,10 +120,53 @@ class ManeuverManager:
         route_current_option: str = "",
         route_next_maneuver: str = "",
         stop_goal_active: bool = False,
+        lane_change_commitment_active: bool | None = None,
     ) -> ManeuverReferenceResult:
         incoming = [dict(sample) for sample in list(reference_samples or [])]
         normalized_decision = str(decision or "").strip().lower()
         phase = self._phase(normalized_decision, behavior_fsm_state, stop_goal_active)
+        normalized_route_next = (
+            str(route_next_maneuver or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        route_advanced_to_lane_change = normalized_route_next in {
+            "lane_change_left",
+            "lane_change_right",
+            "change_lane_left",
+            "change_lane_right",
+        }
+        released_debug: dict[str, object] = {}
+        if (
+            self.active_plan is not None
+            and self.active_plan.maneuver_type == "intersection_turn"
+            and bool(route_advanced_to_lane_change)
+            and normalized_decision not in _TURN
+        ):
+            released_debug = {
+                "maneuver_geometry_release_reason": "route_advanced_to_lane_change",
+                "maneuver_geometry_released_id": str(
+                    self.active_plan.maneuver_id
+                ),
+            }
+            self.active_plan = None
+            self._last_output = []
+        if (
+            self.active_plan is not None
+            and self.active_plan.maneuver_type in {"lane_change", "lane_change_to_turn"}
+            and normalized_decision not in _LANE_CHANGE
+            and lane_change_commitment_active is False
+        ):
+            released_debug = {
+                "maneuver_geometry_release_reason": "lane_change_commitment_complete",
+                "maneuver_geometry_released_id": str(
+                    self.active_plan.maneuver_id
+                ),
+            }
+            self.active_plan = None
+            self._last_output = []
         direction = self._direction(
             normalized_decision,
             route_current_option,
@@ -104,9 +187,21 @@ class ManeuverManager:
         )
 
         if self.active_plan is None and should_start and incoming:
+            # "chained with a route turn" must come from the ROUTE's own
+            # upcoming-maneuver hints, not from `decision` -- a plain
+            # lane_change_left/right decision trivially contains "left"/
+            # "right" itself, so using `direction` (which folds `decision`
+            # into the same text match) here always finds a match and no
+            # lane change was ever classified as the plain "lane_change"
+            # type, even ones with no upcoming turn at all (e.g. a local
+            # static-obstacle avoidance lane change). That silently routed
+            # every lane change through the turn-chained geometry path.
+            route_turn_direction = self._route_direction(
+                route_current_option, route_next_maneuver
+            )
             maneuver_type = (
                 "lane_change_to_turn"
-                if normalized_decision in _LANE_CHANGE and direction
+                if normalized_decision in _LANE_CHANGE and route_turn_direction
                 else "lane_change"
                 if normalized_decision in _LANE_CHANGE
                 else "intersection_turn"
@@ -126,10 +221,12 @@ class ManeuverManager:
 
         if self.active_plan is None:
             self._last_output = []
+            inactive_debug = self._inactive_debug()
+            inactive_debug.update(released_debug)
             return ManeuverReferenceResult(
                 reference_samples=incoming,
                 destination_state=list(destination_state or []),
-                debug=self._inactive_debug(),
+                debug=inactive_debug,
             )
 
         if not should_continue and not should_start:
@@ -257,6 +354,34 @@ class ManeuverManager:
         return ""
 
     @staticmethod
+    def _route_direction(current: str, upcoming: str) -> str:
+        """Return a direction only for an explicit intersection turn hint.
+
+        ``CHANGELANERIGHT`` and ``Lane Change Right`` contain the word
+        ``right`` but are lateral maneuvers, not evidence of a following
+        right turn.  Treating them as turns changes a plain lane-change
+        reference into ``lane_change_to_turn`` and creates a short curved
+        trajectory even when the global route crosses the junction straight.
+        """
+        current_option = str(current or "").strip().upper().replace("_", "")
+        upcoming_option = (
+            str(upcoming or "")
+            .strip()
+            .lower()
+            .replace("-", " ")
+            .replace("_", " ")
+        )
+        if current_option == "RIGHT":
+            return "right"
+        if current_option == "LEFT":
+            return "left"
+        if upcoming_option in {"right", "turn right", "right turn"}:
+            return "right"
+        if upcoming_option in {"left", "turn left", "left turn"}:
+            return "left"
+        return ""
+
+    @staticmethod
     def _route_still_requires_direction(direction: str, current: str, upcoming: str) -> bool:
         if not direction:
             return False
@@ -334,7 +459,22 @@ class ManeuverManager:
     @classmethod
     def _extend_geometry(cls, base, incoming):
         result = [dict(sample) for sample in list(base or [])]
-        for sample in list(incoming or []):
+        source = [dict(sample) for sample in list(incoming or [])]
+        if result and source:
+            # Continue after the incoming point nearest the retained
+            # endpoint.  Iterating from source[0] appends the whole path a
+            # second time whenever base already contains incoming, creating
+            # a terminal->start loop and an artificial ~180 degree heading
+            # reversal once the forward window reaches that seam.
+            lx, ly = cls._xy(result[-1])
+            nearest = min(
+                range(len(source)),
+                key=lambda index: (
+                    cls._xy(source[index])[0] - lx
+                ) ** 2 + (cls._xy(source[index])[1] - ly) ** 2,
+            )
+            source = source[nearest + 1 :]
+        for sample in source:
             if not result:
                 result.append(dict(sample))
                 continue
@@ -364,15 +504,43 @@ class ManeuverManager:
     def _apply_velocity_profile(geometry, incoming):
         result = [dict(sample) for sample in list(geometry or [])]
         source = list(incoming or [])
+        # `result` is the persisted geometry window (may span many ticks
+        # unchanged); `source` is this tick's freshly planned speed
+        # profile, which is very often shorter (e.g. speed_planner only
+        # extends a few points ahead) or simply a different length than
+        # the geometry window. Plain index alignment (source[i]) then
+        # silently repeats source's LAST speed value for every geometry
+        # point beyond len(source), regardless of how far along the
+        # locked maneuver that point actually is -- decoupling commanded
+        # speed from lateral progress (e.g. a stale following-cap speed
+        # from early in a lane change getting stamped onto points already
+        # well into the target lane). Match by each sample's own
+        # `lane_change_progress` instead when both sides carry it: that
+        # tag is a physical/time position along the maneuver shared by
+        # both arrays, not an incidental array offset.
+        source_has_progress = any("lane_change_progress" in item for item in source)
         for index, sample in enumerate(result):
-            if source:
-                speed_sample = source[min(index, len(source) - 1)]
+            if not source:
+                speed = 0.0
+            elif source_has_progress and "lane_change_progress" in sample:
+                target_progress = float(sample.get("lane_change_progress", 0.0) or 0.0)
+                speed_sample = min(
+                    source,
+                    key=lambda item: abs(
+                        float(item.get("lane_change_progress", 0.0) or 0.0)
+                        - target_progress
+                    ),
+                )
                 speed = float(speed_sample.get(
                     "speed_ref_mps",
                     speed_sample.get("v_ref_mps", speed_sample.get("speed_mps", 0.0)),
                 ) or 0.0)
             else:
-                speed = 0.0
+                speed_sample = source[min(index, len(source) - 1)]
+                speed = float(speed_sample.get(
+                    "speed_ref_mps",
+                    speed_sample.get("v_ref_mps", speed_sample.get("speed_mps", 0.0)),
+                ) or 0.0)
             sample["speed_ref_mps"] = speed
             sample["v_ref_mps"] = speed
             sample["speed_mps"] = speed

@@ -30,6 +30,7 @@ class BehaviorCommand:
     ) -> "BehaviorCommand":
         decision = str(behavior_debug.get("decision", "lane_follow"))
         normal_stop = decision in {"stop_at_intersection", "stop_sign"}
+        static_obstacle_stop = decision == "static_obstacle_stop"
         emergency_brake = decision == "emergency_brake"
         return cls(
             decision=decision,
@@ -42,7 +43,9 @@ class BehaviorCommand:
             ),
             reroute_requested=bool(behavior_debug.get("reroute_requested", False)),
             normal_stop=bool(normal_stop),
-            stop_requested=bool(normal_stop or emergency_brake),
+            stop_requested=bool(
+                normal_stop or static_obstacle_stop or emergency_brake
+            ),
             emergency_brake=bool(emergency_brake),
             fsm_state=str(behavior_debug.get("lc_state", "LANE_KEEP")),
             debug_reason=str(

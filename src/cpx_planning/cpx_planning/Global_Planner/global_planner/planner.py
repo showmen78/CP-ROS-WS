@@ -47,6 +47,11 @@ class GlobalPlanner:
         self._signature: dict | None = None
         self._cache_paths: dict[str, Path] | None = None
         self._lane_cache: dict[int, dict] = {}
+        self._lane_spatial_grid: dict[tuple[int, int], set[int]] = {}
+        self._lane_spatial_grid_cell_m = 20.0
+        self._maximum_lane_half_width_m = 3.0
+        self._waypoint_query_cache: dict[tuple[float, float, float, float], Waypoint | None] = {}
+        self._waypoint_query_cache_limit = 32768
         self.active_route: Route | None = None
         self.blocked_lanes: list[int] = []
 
@@ -95,6 +100,7 @@ class GlobalPlanner:
         )
 
         backend.close_map()
+        self._waypoint_query_cache.clear()
         if use_saved_adm_cache:
             backend.load_adm_map(self._cache_paths["adm_config_file"])
             self._lane_cache = load_pickle(self._cache_paths["planner_cache_file"])
@@ -114,6 +120,7 @@ class GlobalPlanner:
                     },
                 )
             backend.save_adm_map(self._cache_paths["adm_file"])
+        self._build_lane_spatial_grid()
         self._loaded = True
 
     def close(self) -> None:
@@ -125,6 +132,8 @@ class GlobalPlanner:
         backend.close_map()
         self._loaded = False
         self.active_route = None
+        self._lane_spatial_grid.clear()
+        self._waypoint_query_cache.clear()
 
     def to_enu(self, position) -> tuple[float, float, float]:
         """Convert one CARLA-world point into the planner's ENU convention.
@@ -149,19 +158,71 @@ class GlobalPlanner:
         output: snapped waypoint or no result (`Waypoint | None`)
         """
         self._ensure_loaded()
-        enu_point = backend.create_enu_point(self.to_enu(position))
+        enu_position = tuple(float(value) for value in self.to_enu(position))
+        search_radius = float(search_radius_m if search_radius_m is not None else self.default_search_radius_m)
+        cache_key = (enu_position[0], enu_position[1], enu_position[2], search_radius)
+        if cache_key in self._waypoint_query_cache:
+            return self._waypoint_query_cache[cache_key]
+        enu_point = backend.create_enu_point(enu_position)
+        relevant_lane_ids = self._nearby_lane_ids(enu_position, search_radius)
         candidates = self._build_route_candidates(
             enu_point,
-            search_radius_m if search_radius_m is not None else self.default_search_radius_m,
+            search_radius,
+            relevant_lane_ids=relevant_lane_ids,
         )
         if not candidates:
+            self._cache_waypoint_query(cache_key, None)
             return None
         best_candidate = candidates[0]
-        return self._make_waypoint_from_lane_offset(
+        waypoint = self._make_waypoint_from_lane_offset(
             best_candidate["lane_id"],
             best_candidate["parametric_offset"],
             enu_position=best_candidate["center_point"],
         )
+        self._cache_waypoint_query(cache_key, waypoint)
+        return waypoint
+
+    def _cache_waypoint_query(self, cache_key, waypoint) -> None:
+        """Keep exact static-map answers bounded without changing map matching."""
+        if len(self._waypoint_query_cache) >= self._waypoint_query_cache_limit:
+            self._waypoint_query_cache.pop(next(iter(self._waypoint_query_cache)))
+        self._waypoint_query_cache[cache_key] = waypoint
+
+    def get_waypoint_candidates(
+        self,
+        position,
+        search_radius_m: float | None = None,
+    ) -> list[dict]:
+        """Return all nearby lane projections for diagnostic map matching.
+
+        Unlike :meth:`get_waypoint`, this method does not choose a lane.  It
+        exposes the geometry/map-match evidence so a stateful matcher can add
+        heading, topology, and history costs before assigning lane identity.
+        """
+
+        self._ensure_loaded()
+        enu_point = backend.create_enu_point(self.to_enu(position))
+        candidates = self._build_route_candidates(
+            enu_point,
+            search_radius_m
+            if search_radius_m is not None
+            else self.default_search_radius_m,
+        )
+        result = []
+        for candidate in candidates:
+            waypoint = self._make_waypoint_from_lane_offset(
+                candidate["lane_id"],
+                candidate["parametric_offset"],
+                enu_position=candidate["center_point"],
+            )
+            result.append({
+                "waypoint": waypoint,
+                "ad_lane_id": int(candidate["lane_id"]),
+                "snap_distance_m": float(candidate["snap_distance"]),
+                "is_in_lane": bool(candidate["is_in_lane"]),
+                "probability": float(candidate["probability"]),
+            })
+        return result
 
     def get_lane_centerline(self, lane_id: int) -> list[Waypoint]:
         """Return cached lane-center waypoints for one AD lane id.
@@ -333,13 +394,46 @@ class GlobalPlanner:
             )
         return samples
 
-    def _build_route_candidates(self, enu_point, search_radius: float) -> list[dict]:
+    def _build_lane_spatial_grid(self) -> None:
+        """Index cached centerline samples so map matching searches only nearby lanes."""
+        maximum_width_m = 0.0
+        for lane_id in self._lane_cache:
+            for offset in (0.0, 0.5, 1.0):
+                width_m = backend.get_lane_width_m(int(lane_id), float(offset))
+                if width_m is not None:
+                    maximum_width_m = max(maximum_width_m, float(width_m))
+        self._maximum_lane_half_width_m = max(3.0, 0.5 * float(maximum_width_m))
+        self._lane_spatial_grid_cell_m = max(12.0, self.default_search_radius_m + self.centerline_spacing_m + self._maximum_lane_half_width_m + 1.0)
+        spatial_grid: dict[tuple[int, int], set[int]] = {}
+        for lane_id, lane_data in self._lane_cache.items():
+            for sample in lane_data.get("centerline_samples", []):
+                x_m, y_m, _ = sample["enu_position"]
+                key = (math.floor(float(x_m) / self._lane_spatial_grid_cell_m), math.floor(float(y_m) / self._lane_spatial_grid_cell_m))
+                spatial_grid.setdefault(key, set()).add(int(lane_id))
+        self._lane_spatial_grid = spatial_grid
+
+    def _nearby_lane_ids(self, enu_position, search_radius: float) -> set[int] | None:
+        """Return every lane that can geometrically reach this map-match search area."""
+        if not self._lane_spatial_grid:
+            return None
+        cell_size_m = float(self._lane_spatial_grid_cell_m)
+        margin_m = float(search_radius) + self.centerline_spacing_m + self._maximum_lane_half_width_m + 1.0
+        span = max(1, int(math.ceil(margin_m / cell_size_m)))
+        center_x = math.floor(float(enu_position[0]) / cell_size_m)
+        center_y = math.floor(float(enu_position[1]) / cell_size_m)
+        lane_ids: set[int] = set()
+        for x_offset in range(-span, span + 1):
+            for y_offset in range(-span, span + 1):
+                lane_ids.update(self._lane_spatial_grid.get((center_x + x_offset, center_y + y_offset), ()))
+        return lane_ids or None
+
+    def _build_route_candidates(self, enu_point, search_radius: float, relevant_lane_ids=None) -> list[dict]:
         """Turn nearby lane matches into sortable snapped routing candidates.
 
-        input: `enu_point` (`ad.map.point.ENUPoint`), `search_radius` (`float`)
+        input: `enu_point` (`ad.map.point.ENUPoint`), `search_radius` (`float`), optional nearby lane ids (`Iterable[int] | None`)
         output: route candidates (`list[dict[str, object]]`)
         """
-        matches = backend.get_map_matches(enu_point, search_radius)
+        matches = backend.get_map_matches(enu_point, search_radius, relevant_lane_ids=relevant_lane_ids)
         raw_point = backend.enu_point_to_tuple(enu_point)
         candidates = []
         for match in matches:

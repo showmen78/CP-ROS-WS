@@ -101,6 +101,10 @@ class CPXRouteManager:
         self._fallback_route_points: List[List[float]] = []
         self._carla_route_planner = None
         self._carla_route_entries: List[Any] = []
+        self._carla_route_nodes_cache_key: Optional[Tuple[int, int, int, int]] = None
+        self._carla_route_nodes_cache: Tuple[Tuple[float, float, float, Any, str], ...] = ()
+        self._geometry_route_points_cache_key: Optional[Tuple[int, int, int, int]] = None
+        self._geometry_route_points_cache: Tuple[Tuple[float, float, float, float], ...] = ()
         self._carla_route_progress_index = 0
         self._carla_route_progress_initialized = False
         self._carla_route_projection: Optional[Tuple[int, float, float, float, float]] = None
@@ -127,6 +131,9 @@ class CPXRouteManager:
             start_point=self._start_point,
             goal_point=self._goal_point,
         )
+        imported_summary = self._register_carla_mission_route_with_global_planner()
+        if imported_summary is not None:
+            self._active_route_summary = imported_summary
         self._fallback_route_points = []
         if not bool(getattr(self._active_route_summary, "route_found", False)) or len(
             list(getattr(self._active_route_summary, "route_waypoints", []) or [])
@@ -168,10 +175,23 @@ class CPXRouteManager:
                 goal_location=self._goal_point,
                 replace_stored_route=True,
             )
-            self._build_carla_route(
-                start_point=normalized_start,
-                goal_point=self._goal_point,
-            )
+            if str(trigger_reason).strip().lower().startswith("static_obstacle"):
+                if (
+                    not bool(getattr(summary, "route_found", False))
+                    or len(list(getattr(summary, "route_waypoints", []) or [])) < 2
+                ):
+                    raise RuntimeError("blocked_summary_route_not_found")
+                self._build_carla_route_from_summary(summary)
+            else:
+                self._build_carla_route(
+                    start_point=normalized_start,
+                    goal_point=self._goal_point,
+                )
+                imported_summary = (
+                    self._register_carla_mission_route_with_global_planner()
+                )
+                if imported_summary is not None:
+                    summary = imported_summary
             route_point_count = len(self._carla_route_nodes())
             if route_point_count < 2:
                 raise RuntimeError(str(self._carla_route_debug_reason))
@@ -181,7 +201,9 @@ class CPXRouteManager:
             self._fallback_route_points = []
             self._last_status = self._status_from_summary(summary)
             self._carla_route_debug_reason = (
-                f"carla_grp_route_replanned:{str(trigger_reason)}"
+                f"blocked_summary_route_replanned:{str(trigger_reason)}"
+                if str(trigger_reason).strip().lower().startswith("static_obstacle")
+                else f"carla_grp_route_replanned:{str(trigger_reason)}"
             )
             return RouteReplanResult(
                 True,
@@ -276,6 +298,9 @@ class CPXRouteManager:
                 "z": nodes[-1][2],
             }
         )
+        imported_summary = self._register_carla_mission_route_with_global_planner()
+        if imported_summary is not None:
+            self._active_route_summary = imported_summary
         self._last_status = RouteManagerStatus(
             route_found=True,
             route_point_count=len(nodes),
@@ -283,6 +308,29 @@ class CPXRouteManager:
             reached_destination=False,
             debug_reason="external_leaderboard_route_ready",
         )
+
+    def _register_carla_mission_route_with_global_planner(self) -> Any:
+        """Map-match the supplied mission route into the semantic backend.
+
+        Start/goal-only Dijkstra is allowed to choose a different valid road
+        sequence from CARLA/OpenCDA's scenario route.  Importing the ordered
+        GRP geometry keeps one mission route while still letting AD-map own
+        stable lane identity, topology, maneuver labels, and progress.
+        """
+        register = getattr(self.global_planner, "register_imported_route", None)
+        nodes = self._carla_route_nodes()
+        if not callable(register) or len(nodes) < 2:
+            return None
+        route_points = [
+            [float(node[0]), float(node[1]), float(node[2])]
+            for node in nodes
+        ]
+        try:
+            return register(route_points)
+        except Exception:
+            # Geometry remains usable and the original planner route remains
+            # intact if an optional semantic backend cannot import a point.
+            return None
 
     def get_route_info(
         self,
@@ -408,6 +456,11 @@ class CPXRouteManager:
         options = [str(node[4]) for node in nodes[index + 1 : index + 81]]
         current_option = str(nodes[min(index + 1, len(nodes) - 1)][4])
         next_macro = _next_macro_from_carla_options(options)
+        next_macro_distance_m = _distance_to_next_carla_macro(
+            nodes=nodes,
+            start_index=int(index),
+            projection=self._carla_route_projection,
+        )
         optimal_lane_id = _route_required_carla_lane_id(
             nodes=nodes,
             start_index=int(index),
@@ -428,6 +481,7 @@ class CPXRouteManager:
             "optimal_lane_id": int(optimal_lane_id),
             "current_road_option": str(current_option),
             "next_macro_maneuver": str(next_macro),
+            "next_macro_distance_m": next_macro_distance_m,
             "debug_reason": "carla_grp_route_active",
             "remaining_distance_m": float(remaining),
             "reached_destination": bool(reached),
@@ -469,6 +523,11 @@ class CPXRouteManager:
         options = [str(node[4]) for node in nodes[index + 1 : index + 81]]
         current_option = str(nodes[min(index + 1, len(nodes) - 1)][4])
         next_macro = _next_macro_from_carla_options(options)
+        next_macro_distance_m = _distance_to_next_carla_macro(
+            nodes=nodes,
+            start_index=int(index),
+            projection=self._carla_route_projection,
+        )
         remaining = self._remaining_distance_on_fallback_route(
             x_m=float(x_m),
             y_m=float(y_m),
@@ -486,6 +545,7 @@ class CPXRouteManager:
             "optimal_lane_id": int(lane_id),
             "current_road_option": str(current_option),
             "next_macro_maneuver": str(next_macro),
+            "next_macro_distance_m": next_macro_distance_m,
             "debug_reason": "external_leaderboard_route_active",
             "remaining_distance_m": float(remaining),
             "reached_destination": bool(reached),
@@ -549,6 +609,9 @@ class CPXRouteManager:
 
         nodes = self._carla_route_nodes()
         if len(nodes) >= 2:
+            cache_key = self._carla_route_entries_cache_key()
+            if self._geometry_route_points_cache_key == cache_key:
+                return [list(point) for point in self._geometry_route_points_cache]
             points: List[List[float]] = []
             for index, node in enumerate(nodes):
                 if index + 1 < len(nodes):
@@ -567,6 +630,8 @@ class CPXRouteManager:
                     float(node[2]),
                     float(heading_rad),
                 ])
+            self._geometry_route_points_cache_key = cache_key
+            self._geometry_route_points_cache = tuple(tuple(float(value) for value in point) for point in points)
             return points
         return self.route_points(x_m=x_m, y_m=y_m, query_key=query_key)
 
@@ -986,6 +1051,9 @@ class CPXRouteManager:
         return str(self._carla_route_sync_reason)
 
     def _carla_route_nodes(self) -> List[Tuple[float, float, float, Any, str]]:
+        cache_key = self._carla_route_entries_cache_key()
+        if self._carla_route_nodes_cache_key == cache_key:
+            return list(self._carla_route_nodes_cache)
         nodes: List[Tuple[float, float, float, Any, str]] = []
         for entry in list(self._carla_route_entries or []):
             waypoint, option = _carla_route_entry(entry)
@@ -998,7 +1066,14 @@ class CPXRouteManager:
             if nodes and math.hypot(x_m - nodes[-1][0], y_m - nodes[-1][1]) < 1.0e-3:
                 continue
             nodes.append((x_m, y_m, z_m, waypoint, _road_option_name(option)))
+        self._carla_route_nodes_cache_key = cache_key
+        self._carla_route_nodes_cache = tuple(nodes)
         return nodes
+
+    def _carla_route_entries_cache_key(self) -> Tuple[int, int, int, int]:
+        """Identify the immutable route-entry snapshot used by geometry caches."""
+        entries = self._carla_route_entries
+        return (id(entries), len(entries), id(entries[0]) if entries else 0, id(entries[-1]) if entries else 0)
 
     @property
     def carla_route_debug_reason(self) -> str:
@@ -1020,6 +1095,52 @@ class CPXRouteManager:
     def active_route_summary(self) -> Any:
         return self._active_route_summary
 
+    def accept_authoritative_route_summary(
+        self,
+        summary: Any,
+        *,
+        debug_reason: str = "authoritative_route_summary",
+    ) -> RouteManagerStatus:
+        """Publish one route backend's per-tick progress as manager state.
+
+        The custom AD-map path queries its route directly because AD lane
+        identities and maneuver semantics must not be inferred from the CARLA
+        geometry route.  Publishing that same query here keeps diagnostics,
+        destination completion, and behavior input on one progress source.
+        CARLA route progress remains available only for geometry sampling.
+        """
+
+        def value(name: str, default: Any = None) -> Any:
+            if isinstance(summary, Mapping):
+                return summary.get(name, default)
+            return getattr(summary, name, default)
+
+        route_found = bool(value("route_found", False))
+        remaining = max(
+            0.0,
+            float(
+                value(
+                    "distance_to_destination_m",
+                    value("remaining_distance_m", 0.0),
+                )
+                or 0.0
+            ),
+        )
+        route_waypoints = list(value("route_waypoints", []) or [])
+        route_point_count = max(
+            len(route_waypoints),
+            len(self._fallback_route_points),
+        )
+        reached = bool(route_found and remaining <= self.reached_distance_m)
+        self._last_status = RouteManagerStatus(
+            route_found=route_found,
+            route_point_count=int(route_point_count),
+            remaining_distance_m=float(remaining),
+            reached_destination=reached,
+            debug_reason=str(debug_reason),
+        )
+        return self._last_status
+
     def _build_carla_route(
         self,
         *,
@@ -1029,12 +1150,16 @@ class CPXRouteManager:
         """Populate the existing route interface from the custom AD-map route."""
 
         del start_point, goal_point
+        self._build_carla_route_from_summary(self._active_route_summary)
+
+    def _build_carla_route_from_summary(self, summary: Any) -> None:
+        """Populate the route interface from one custom AD-map route summary."""
+
         self._carla_route_entries = []
         self._carla_route_progress_index = 0
         self._carla_route_progress_initialized = False
         self._carla_route_projection = None
         self._carla_route_sync_reason = "custom_route_progress_not_initialized"
-        summary = self._active_route_summary
         route_points = list(getattr(summary, "route_waypoints", []) or [])
         road_options = list(getattr(summary, "road_options", []) or [])
         for index, point in enumerate(route_points):
@@ -1755,6 +1880,42 @@ def _next_macro_from_carla_options(options: Sequence[str]) -> str:
     return "Continue Straight"
 
 
+def _distance_to_next_carla_macro(
+    *,
+    nodes: Sequence[Tuple[float, float, float, Any, str]],
+    start_index: int,
+    projection: Optional[Tuple[int, float, float, float, float]] = None,
+) -> Optional[float]:
+    """Along-route distance from ego projection to the next macro node."""
+
+    if len(nodes) < 2:
+        return None
+    index = min(max(0, int(start_index)), len(nodes) - 2)
+    if projection is not None:
+        previous_xy = (float(projection[1]), float(projection[2]))
+    else:
+        previous_xy = (float(nodes[index][0]), float(nodes[index][1]))
+    distance_m = 0.0
+    macro_options = {
+        "CHANGELANELEFT",
+        "CHANGELANERIGHT",
+        "LEFT",
+        "RIGHT",
+        "STRAIGHT",
+    }
+    for node in list(nodes[index + 1 : index + 81]):
+        current_xy = (float(node[0]), float(node[1]))
+        distance_m += math.hypot(
+            current_xy[0] - previous_xy[0],
+            current_xy[1] - previous_xy[1],
+        )
+        option = str(node[4] or "").strip().upper().replace("_", "")
+        if option in macro_options:
+            return float(distance_m)
+        previous_xy = current_xy
+    return None
+
+
 def _route_required_carla_lane_id(
     *,
     nodes: Sequence[Tuple[float, float, float, Any, str]],
@@ -1783,26 +1944,39 @@ def _route_required_carla_lane_id(
             if option in {"LEFT", "RIGHT", "STRAIGHT"}:
                 break
             continue
+        # A CARLA CHANGELANE option is an adjacent-lane edge, so its target
+        # is exactly one stable lane-id step from ego.  Do not let an
+        # independent canonical recount at the remote maneuver waypoint
+        # override that fact: on roads where lanes appear/disappear between
+        # ego and the maneuver point, that local recount can turn a physical
+        # 2 -> 1 right change into an impossible target such as 5.
+        expected_hop = 1 if option == "CHANGELANELEFT" else -1
         hop = None
         if ego_waypoint is not None:
             from cpx_planning.utility.lane_graph import lane_hop_offset
 
             hop = lane_hop_offset(ego_waypoint, node[3])
-        if hop is not None:
+        if hop is not None and int(hop) == int(expected_hop):
             candidate_lane_id = int(current_lane_id) + int(hop)
         else:
-            # No provable lane-to-lane connectivity to the maneuver point
-            # (ego_waypoint unavailable, or the hop search couldn't reach it)
-            # -- fall back to the previous local-recount behavior rather than
-            # silently dropping the maneuver.
-            candidate_lane_id = int(_canonical_carla_lane_id(node[3], current_lane_id))
+            local_candidate_lane_id = int(
+                _canonical_carla_lane_id(node[3], current_lane_id)
+            )
             raw_lane_id = int(getattr(node[3], "lane_id", 0) or 0)
             if (
-                candidate_lane_id == current_lane_id
+                local_candidate_lane_id == current_lane_id
                 and raw_lane_id > 0
-                and raw_lane_id != current_lane_id
+                and abs(int(raw_lane_id) - int(current_lane_id)) == 1
             ):
-                candidate_lane_id = int(raw_lane_id)
+                local_candidate_lane_id = int(raw_lane_id)
+            if abs(int(local_candidate_lane_id) - int(current_lane_id)) == 1:
+                # Compatibility for externally supplied/synthetic routes
+                # whose lane-id orientation is not the runtime stable-id
+                # convention, but whose target is still unambiguously
+                # adjacent.
+                candidate_lane_id = int(local_candidate_lane_id)
+            else:
+                candidate_lane_id = int(current_lane_id) + int(expected_hop)
         if candidate_lane_id != 0 and candidate_lane_id != current_lane_id:
             return int(candidate_lane_id)
     return int(current_lane_id)

@@ -232,6 +232,7 @@ def validate_reference_contract(
                     if bool(contract.allow_route_branch)
                     else int(contract.expected_lane_id)
                 ),
+                allow_lane_transition=bool(contract.allow_lane_transition),
             )
             if result.destination_lane_error_m > float(contract.max_destination_lane_error_m):
                 violations.append("destination_lane_error_out_of_contract")
@@ -263,6 +264,13 @@ def _is_longitudinal_lane_successor(sample: Mapping[str, object]) -> bool:
 
     transition_kind = str(sample.get("lane_transition_kind", "")).strip().lower()
     return transition_kind == "longitudinal_successor"
+
+
+def _is_lateral_lane_change_sample(sample: Mapping[str, object]) -> bool:
+    """Return whether a point belongs to an authorized lateral transition."""
+
+    transition_kind = str(sample.get("lane_transition_kind", "")).strip().lower()
+    return transition_kind == "lateral_lane_change"
 
 
 def _mode_defaults(mode: str) -> Mapping[str, object]:
@@ -350,6 +358,7 @@ def _nearest_lane_error_m(
     reference_lane_ids: Sequence[int],
     reference_samples: Sequence[Mapping[str, object]],
     expected_lane_id: int,
+    allow_lane_transition: bool = False,
 ) -> float:
     candidates = [
         point
@@ -363,6 +372,10 @@ def _nearest_lane_error_m(
             or int(lane_id) == 0
             or int(lane_id) == int(expected_lane_id)
             or _is_longitudinal_lane_successor(sample)
+            or (
+                bool(allow_lane_transition)
+                and _is_lateral_lane_change_sample(sample)
+            )
         )
     ]
     if not candidates:

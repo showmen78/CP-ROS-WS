@@ -23,7 +23,7 @@ class GlobalPlannerNode(Node):
     def __init__(self, local_bus=None):
         super().__init__("global_planner_node")
         package_root = Path(__file__).resolve().parent
-        self.declare_parameter("xodr_path", str(package_root / "Global_Planner" / "maps" / "Town10HD_Opt.xodr"))
+        self.declare_parameter("xodr_path", str(package_root / "Global_Planner" / "maps" / "Town06.xodr"))
         self.declare_parameter("cache_root", os.environ.get("CPX_GLOBAL_PLANNER_CACHE_ROOT", str(Path.home() / ".cache" / "cpx_planning" / "global_planner")))
         self.declare_parameter("ad_map_install_root", os.environ.get("GLOBAL_PLANNER_AD_MAP_INSTALL", ""))
         self.declare_parameter("route_sample_distance_m", 2.0)
@@ -63,7 +63,7 @@ class GlobalPlannerNode(Node):
     def component_call(self, operation, payload, cycle_id, header):
         """Dispatch the existing custom-planner and route-manager method names for one topic request."""
         cache_key = (int(cycle_id), str(operation), encode_json(payload))
-        cacheable = str(operation) in {"get_waypoint", "get_local_lane_context", "waypoint_left", "waypoint_right", "waypoint_next", "waypoint_previous"}
+        cacheable = str(operation) in {"get_waypoint", "get_waypoint_candidates", "get_local_lane_context", "get_local_lane_graph", "waypoint_left", "waypoint_right", "waypoint_next", "waypoint_previous"}
         with self._state_lock:
             if cacheable and cache_key in self._cycle_cache:
                 return self._cycle_cache[cache_key]
@@ -82,6 +82,10 @@ class GlobalPlannerNode(Node):
             return self._remote_waypoint(self.map_planner.get_waypoint(payload["point"]))
         if operation == "get_local_lane_context":
             return self.map_planner.get_local_lane_context(**payload)
+        if operation == "get_waypoint_candidates":
+            return self.map_planner.get_waypoint_candidates(payload["point"])
+        if operation == "get_local_lane_graph":
+            return self.map_planner.get_local_lane_graph(**payload)
         if operation == "plan_route_from_locations":
             return self.map_planner.plan_route_from_locations(**payload)
         if operation == "trace_route":

@@ -1,6 +1,7 @@
 """Publish nearby OpenCDA V2X CAVs as Autoware tracked objects."""
 
 import math
+import time
 import uuid
 
 from autoware_perception_msgs.msg import ObjectClassification
@@ -12,6 +13,7 @@ import rclpy
 from rclpy.node import Node
 
 from .tcp_json_receiver import TcpJsonReceiver
+from .timing import configure_timing, publish_transport_timing
 
 
 def _set_stamp(stamp, timestamp_s):
@@ -90,11 +92,13 @@ class V2XPublisher(Node):
         )
         # CP obstacles use the same typed ROS interface as perception objects.
         self.cp_obstacles_publisher = self.create_publisher(TrackedObjects, "/cpx/cp_obstacles", 10)
-        self.receiver = TcpJsonReceiver(5054, self.get_logger())
-        self.create_timer(0.02, self.publish_messages)
+        self.debug_time, self.timing_publisher, self.timing_stream = configure_timing(self, "v2x")
+        self.message_guard = self.create_guard_condition(self.publish_messages)
+        self.receiver = TcpJsonReceiver(5054, self.get_logger(), on_message=self.message_guard.trigger)
 
     def publish_messages(self):
         for data in self.receiver.get_messages():
+            publish_started_ns = time.time_ns()
             payload = data.get("data", data)
             message = TrackedObjects()
             timestamp_s = data.get(
@@ -115,6 +119,7 @@ class V2XPublisher(Node):
             for item in payload.get("cp_obstacles", []):
                 cp_message.objects.append(_tracked_object_from_item(item))
             self.cp_obstacles_publisher.publish(cp_message)
+            publish_transport_timing(self.timing_publisher, data, self.timing_stream, publish_started_ns, time.time_ns())
 
     def destroy_node(self):
         self.receiver.close()

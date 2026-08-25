@@ -16,6 +16,8 @@ class MPCControlBuffer:
         replan_period_s: float = 0.25,
         max_reuse_s: float = 0.35,
         max_reference_anchor_jump_m: float = 0.75,
+        max_predicted_speed_error_mps: float = 0.75,
+        max_target_speed_jump_mps: float = 1.0,
     ) -> None:
         self.enabled = bool(enabled)
         self.replan_period_s = max(0.0, float(replan_period_s))
@@ -23,9 +25,17 @@ class MPCControlBuffer:
         self.max_reference_anchor_jump_m = max(
             0.0, float(max_reference_anchor_jump_m)
         )
+        self.max_predicted_speed_error_mps = max(
+            0.0, float(max_predicted_speed_error_mps)
+        )
+        self.max_target_speed_jump_mps = max(
+            0.0, float(max_target_speed_jump_mps)
+        )
         self._plan_time_s: Optional[float] = None
         self._dt_s = 0.05
         self._sequence: List[Tuple[float, float]] = []
+        self._predicted_speed_sequence_mps: List[float] = []
+        self._plan_target_speed_mps: Optional[float] = None
         self._context_key = ""
         self._reference_anchor_xy: Optional[Tuple[float, float]] = None
         self._last_reason = "control_buffer_empty"
@@ -65,6 +75,9 @@ class MPCControlBuffer:
         if self._reference_anchor_jump_exceeded(reference_anchor_xy):
             self._last_reason = "control_buffer_reference_anchor_jump"
             return True
+        if self._target_speed_jump_exceeded(target_speed_mps):
+            self._last_reason = "control_buffer_target_speed_jumped"
+            return True
         age_s = max(0.0, float(sim_time_s) - float(self._plan_time_s))
         if age_s >= float(self.replan_period_s):
             self._last_reason = "control_buffer_replan_period_elapsed"
@@ -72,8 +85,92 @@ class MPCControlBuffer:
         if age_s > float(self.max_reuse_s):
             self._last_reason = "control_buffer_max_reuse_elapsed"
             return True
+        if self._predicted_speed_error_exceeded(
+            age_s=float(age_s),
+            ego_speed_mps=ego_speed_mps,
+        ):
+            self._last_reason = "control_buffer_predicted_speed_diverged"
+            return True
         self._last_reason = "control_buffer_reuse"
         return False
+
+    def _target_speed_jump_exceeded(
+        self,
+        target_speed_mps: Optional[float],
+    ) -> bool:
+        """Detect the requested cruise speed itself jumping between ticks.
+
+        This is distinct from ``_longitudinal_replan_reason``'s crossing/
+        deadband check, which only fires when ego's speed error relative to
+        target changes sign or enters a narrow band -- it stays silent
+        whenever ego was already on the same side of a moving target both
+        before and after a large jump (e.g. target steps from ~2 m/s to
+        ~5 m/s while ego, already below both, never crosses anything). A
+        buffered plan solved against the old target has no reason to still
+        be valid once the target itself has moved this much.
+        """
+
+        if target_speed_mps is None or self._plan_target_speed_mps is None:
+            return False
+        try:
+            current_target_mps = float(target_speed_mps)
+            plan_target_mps = float(self._plan_target_speed_mps)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(current_target_mps) or not math.isfinite(plan_target_mps):
+            return False
+        return bool(
+            abs(current_target_mps - plan_target_mps)
+            > float(self.max_target_speed_jump_mps)
+        )
+
+    def _predicted_speed_error_exceeded(
+        self,
+        *,
+        age_s: float,
+        ego_speed_mps: Optional[float],
+    ) -> bool:
+        """Detect open-loop drift between the buffered plan and reality.
+
+        ``_sequence``/``_predicted_speed_sequence_mps`` are the *open-loop*
+        acceleration and state trajectory from a single MPC solve, replayed
+        for up to ``max_reuse_s`` with no feedback in between. If the
+        vehicle's actual speed has already drifted away from what that
+        solve predicted for "now" -- e.g. real deceleration outrunning the
+        plan because of actuator lag or a solve that itself dips low before
+        recovering later in its own horizon -- continuing to play back the
+        rest of that stale plan compounds the error instead of correcting
+        it. Forcing an early replan here is the feedback a pure open-loop
+        buffer is missing.
+        """
+
+        if ego_speed_mps is None or not self._predicted_speed_sequence_mps:
+            return False
+        try:
+            actual_speed_mps = float(ego_speed_mps)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(actual_speed_mps):
+            return False
+        predicted_speed_mps = self._predicted_speed_at_age(float(age_s))
+        if predicted_speed_mps is None:
+            return False
+        return bool(
+            abs(actual_speed_mps - float(predicted_speed_mps))
+            > float(self.max_predicted_speed_error_mps)
+        )
+
+    def _predicted_speed_at_age(self, age_s: float) -> Optional[float]:
+        if not self._predicted_speed_sequence_mps:
+            return None
+        index = self._index_for_age(float(age_s))
+        if index >= len(self._predicted_speed_sequence_mps):
+            return None
+        return float(self._predicted_speed_sequence_mps[index])
+
+    def _index_for_age(self, age_s: float) -> int:
+        raw_index = int(round(float(age_s) / max(1.0e-3, float(self._dt_s))))
+        return max(0, raw_index)
 
     def update_from_solution(
         self,
@@ -83,6 +180,8 @@ class MPCControlBuffer:
         dt_s: float,
         context_key: str = "",
         reference_anchor_xy: Optional[Tuple[float, float]] = None,
+        predicted_speed_sequence_mps: Optional[Any] = None,
+        target_speed_mps: Optional[float] = None,
     ) -> None:
         self._plan_time_s = float(plan_time_s)
         self._dt_s = max(1.0e-3, float(dt_s))
@@ -103,6 +202,32 @@ class MPCControlBuffer:
                     continue
             sequence.append((float(accel), float(steer)))
         self._sequence = sequence
+        # predicted_speed_sequence_mps is x_solution[:, 2] -- the state
+        # trajectory's own velocity prediction, aligned index-for-index
+        # with the *state* at each step (one longer than u_solution, whose
+        # entry k is the control applied *between* states k and k+1).
+        # Reusing the same age-based index as sample()/u_solution here is
+        # deliberate: it lets should_replan() ask "is reality still close
+        # to what step `sample() is about to use` assumed," not just "close
+        # to what step 0 assumed."
+        predicted_speeds: List[float] = []
+        try:
+            for index in range(int(len(predicted_speed_sequence_mps or []))):
+                try:
+                    predicted_speeds.append(
+                        float(predicted_speed_sequence_mps[index])
+                    )
+                except (TypeError, ValueError, IndexError):
+                    break
+        except Exception:
+            predicted_speeds = []
+        self._predicted_speed_sequence_mps = predicted_speeds
+        try:
+            self._plan_target_speed_mps = (
+                None if target_speed_mps is None else float(target_speed_mps)
+            )
+        except (TypeError, ValueError):
+            self._plan_target_speed_mps = None
         self._context_key = str(context_key or "")
         self._reference_anchor_xy = self._finite_anchor(reference_anchor_xy)
         self._last_reason = "control_buffer_updated"
@@ -127,8 +252,7 @@ class MPCControlBuffer:
         if self._reference_anchor_jump_exceeded(reference_anchor_xy):
             self._last_reason = "control_buffer_reference_anchor_jump"
             return None
-        index = int(round(age_s / max(1.0e-3, float(self._dt_s))))
-        index = max(0, min(index, len(self._sequence) - 1))
+        index = min(self._index_for_age(float(age_s)), len(self._sequence) - 1)
         accel, steer = self._sequence[index]
         self._last_reason = f"control_buffer_reuse_step:{int(index)}"
         return float(accel), float(steer), str(self._last_reason)
@@ -136,6 +260,8 @@ class MPCControlBuffer:
     def reset(self, *, reason: str = "control_buffer_reset") -> None:
         self._plan_time_s = None
         self._sequence = []
+        self._predicted_speed_sequence_mps = []
+        self._plan_target_speed_mps = None
         self._context_key = ""
         self._reference_anchor_xy = None
         self._previous_speed_error_mps = None

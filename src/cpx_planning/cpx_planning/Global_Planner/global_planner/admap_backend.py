@@ -7,6 +7,8 @@ from pathlib import Path
 from .runtime import import_ad_map_access
 
 ad = None
+_map_matcher = None
+_map_matcher_relevant_lane_ids = None
 
 
 def _get_compatible_attribute(value, *attribute_names):
@@ -39,6 +41,31 @@ def ensure_runtime_ready(ad_map_install_root: str | Path | None = None):
     if ad is None:
         ad = import_ad_map_access(ad_map_install_root)
     return ad
+
+
+def _get_map_matcher(relevant_lane_ids=None):
+    """Return a reusable matcher for the active map and lane filter."""
+    global _map_matcher, _map_matcher_relevant_lane_ids
+
+    relevant_key = None if relevant_lane_ids is None else tuple(sorted(int(lane_id) for lane_id in relevant_lane_ids))
+    if _map_matcher is None or _map_matcher_relevant_lane_ids != relevant_key:
+        matcher = ad.map.match.AdMapMatching()
+        if relevant_key:
+            lane_ids = ad.map.lane.LaneIdSet()
+            for lane_id in relevant_key:
+                lane_ids.add(int(lane_id))
+            matcher.setRelevantLanes(lane_ids)
+        _map_matcher = matcher
+        _map_matcher_relevant_lane_ids = relevant_key
+    return _map_matcher
+
+
+def _reset_map_matcher() -> None:
+    """Invalidate the cached matcher after the active map changes."""
+    global _map_matcher, _map_matcher_relevant_lane_ids
+
+    _map_matcher = None
+    _map_matcher_relevant_lane_ids = None
 
 
 def to_base_value(value):
@@ -148,6 +175,7 @@ def load_open_drive_map(xodr_path: str | Path, overlap_margin: float = 0.05) -> 
         )
     if not initialized:
         raise RuntimeError(f"Failed to load map: {path}")
+    _reset_map_matcher()
     return get_all_lane_ids()
 
 
@@ -162,6 +190,7 @@ def load_adm_map(adm_config_path: str | Path) -> bool:
         raise FileNotFoundError(path)
     if not ad.map.access.init(str(path)):
         raise RuntimeError(f"Failed to load cached AD map: {path}")
+    _reset_map_matcher()
     return True
 
 
@@ -193,6 +222,7 @@ def close_map() -> None:
     output: none (`None`)
     """
     ad.map.access.cleanup()
+    _reset_map_matcher()
 
 
 def get_lane(lane_id: int):
@@ -240,13 +270,13 @@ def is_routable_match(map_match) -> bool:
     return is_routeable_lane(get_match_lane_id(map_match))
 
 
-def get_map_matches(enu_point, search_radius: float = 8.0) -> list:
+def get_map_matches(enu_point, search_radius: float = 8.0, relevant_lane_ids=None) -> list:
     """Find nearby routable AD-map lane matches for one ENU position.
 
-    input: `enu_point` (`ad.map.point.ENUPoint`), `search_radius` (`float`)
+    input: `enu_point` (`ad.map.point.ENUPoint`), `search_radius` (`float`), optional nearby lane ids (`Iterable[int] | None`)
     output: routable map matches (`list`)
     """
-    matcher = ad.map.match.AdMapMatching()
+    matcher = _get_map_matcher(relevant_lane_ids)
     matches = matcher.getMapMatchedPositions(
         enu_point,
         ad.physics.Distance(search_radius),

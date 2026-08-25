@@ -1,8 +1,6 @@
-# These are the default global-route settings from the same OpenCDA profile.
-# ROS keeps the field names, while the active map backend is CustomGlobalPlannerAdapter.
 global_planner:
   use_opencda_global_route: true
   opencda_global_route_reference_allowed: true
   global_planner_mode: dij
-  global_planner_xodr_path: Global_Planner/maps/Town10HD_Opt.xodr
-  global_planner_strict: false
+  global_planner_xodr_path: Global_Planner/maps/Town06.xodr
+  global_planner_strict: true

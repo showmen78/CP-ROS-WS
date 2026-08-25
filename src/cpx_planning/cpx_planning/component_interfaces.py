@@ -174,21 +174,25 @@ class LocalComponentBus:
 
     The separated nodes still own and lock their original component objects.
     This bus only avoids sending a local request through DDS and then blocking
-    for the matching local result. Values cross the same wire conversion
-    boundary, so a component cannot accidentally mutate the caller's objects.
-    Standalone node executables do not receive this bus and keep using the ROS
-    request/result topics.
+    for the matching local result. The normal fast launch passes the existing
+    CP-X objects directly, matching the monolithic planner's call behavior.
+    When full topic debugging is enabled, values still cross the wire
+    conversion boundary. Standalone node executables do not receive this bus
+    and keep using the ROS request/result topics.
     """
 
-    def __init__(self, mirror_payloads: bool = False, mirror_markers: bool = False):
+    def __init__(self, mirror_payloads: bool = False, mirror_markers: bool = False, timing_recorder=None):
         self._servers = {}
         self._input_frames = {}
         self._frame_order = []
         self._request_ids = itertools.count(1)
         self.mirror_payloads = bool(mirror_payloads)
         self.mirror_markers = bool(mirror_markers)
+        self.timing_recorder = timing_recorder
         self._mirrored_cycles = set()
         self._mirrored_cycle_order = []
+        self._map_query_cache_cycle_id = None
+        self._map_query_cache = {}
         self._lock = threading.RLock()
 
     def register_server(self, request_topic: str, server) -> None:
@@ -218,7 +222,36 @@ class LocalComponentBus:
         with self._lock:
             return self._input_frames.get(int(cycle_id))
 
+    def cached_map_call(self, cycle_id: int, cache_key, callback):
+        """Run one exact map query at most once during a planning cycle.
+
+        The copied planner is allowed to ask the same map question in several
+        stages. The map is static, so returning the first exact answer again
+        preserves the planner result while avoiding another AD-map lookup.
+        """
+        cycle_id = int(cycle_id)
+        if cycle_id <= 0:
+            started = time.perf_counter()
+            return callback(), False, (time.perf_counter() - started) * 1000.0
+        with self._lock:
+            if self._map_query_cache_cycle_id != cycle_id:
+                self._map_query_cache_cycle_id = cycle_id
+                self._map_query_cache.clear()
+            if cache_key in self._map_query_cache:
+                return self._map_query_cache[cache_key], True, 0.0
+        started = time.perf_counter()
+        result = callback()
+        execution_ms = (time.perf_counter() - started) * 1000.0
+        with self._lock:
+            if self._map_query_cache_cycle_id == cycle_id:
+                self._map_query_cache[cache_key] = result
+        return result, False, execution_ms
+
     def call(self, request_topic: str, operation: str, payload: Any, *, cycle_id: int, timestamp_s: float, waypoint_client=None, component_client=None) -> Any:
+        call_started = time.perf_counter()
+        stage_prefix = "component.{}.{}".format(str(request_topic).strip("/").replace("/", "."), str(operation))
+        forwarding_prefix = "inter_node_forwarding.{}.{}".format(str(request_topic).strip("/").replace("/", "."), str(operation))
+        scheduling_prefix = "node_scheduling.component.{}.{}".format(str(request_topic).strip("/").replace("/", "."), str(operation))
         with self._lock:
             server = self._servers.get(str(request_topic))
         if server is None:
@@ -233,7 +266,15 @@ class LocalComponentBus:
         request.operation = str(operation)
         request.success = True
         request.reason = ""
-        wire_payload = to_wire(payload)
+        # The composed launch keeps all ROS nodes in one process. Pass the
+        # original CP-X value directly, just as the monolithic OpenCDA planner
+        # does, instead of recursively copying it to and from a JSON-shaped
+        # value. Standalone nodes still use the normal topic serialization in
+        # ComponentClient and ComponentServer below.
+        use_wire_copy = bool(self.mirror_payloads)
+        encode_started = time.perf_counter()
+        wire_payload = to_wire(payload) if use_wire_copy else payload
+        self._record_timing(cycle_id, stage_prefix + ".request_copy", encode_started)
         request.payload_json = encode_json(payload) if self.mirror_payloads else ""
         mirror_key = (str(request_topic), int(cycle_id))
         with self._lock:
@@ -255,9 +296,17 @@ class LocalComponentBus:
         response.requester = str(request.requester)
         response.operation = str(operation)
         try:
-            server_payload = from_wire(wire_payload, waypoint_client=server.waypoint_client)
+            server_payload = from_wire(wire_payload, waypoint_client=server.waypoint_client) if use_wire_copy else wire_payload
+            request_forwarded = time.perf_counter()
+            self._record_timing(cycle_id, forwarding_prefix + ".request", call_started)
+            dispatch_ready = time.perf_counter()
+            dispatch_started = time.perf_counter()
+            self._record_timing(cycle_id, scheduling_prefix + ".direct_dispatch", dispatch_ready)
             result = server.dispatch(str(operation), server_payload, int(cycle_id), request.header)
-            wire_result = to_wire(result)
+            self._record_timing(cycle_id, stage_prefix + ".node_execution", dispatch_started)
+            response_copy_started = time.perf_counter()
+            wire_result = to_wire(result) if use_wire_copy else result
+            self._record_timing(cycle_id, stage_prefix + ".response_copy", response_copy_started)
             response.success = True
             response.reason = ""
             response.payload_json = encode_json(result) if self.mirror_payloads else ""
@@ -269,7 +318,24 @@ class LocalComponentBus:
             server.publisher.publish(response)
         if not bool(response.success):
             raise RuntimeError("{} failed: {}".format(request_topic, response.reason))
-        return from_wire(wire_result, waypoint_client=waypoint_client)
+        decode_started = time.perf_counter()
+        decoded_result = from_wire(wire_result, waypoint_client=waypoint_client) if use_wire_copy else wire_result
+        self._record_timing(cycle_id, stage_prefix + ".return_decode", decode_started)
+        response_returned = time.perf_counter()
+        self._record_timing(cycle_id, forwarding_prefix + ".response", response_copy_started)
+        recorder = self.timing_recorder
+        if recorder is not None:
+            request_forwarding_ms = max(0.0, (request_forwarded - call_started) * 1000.0)
+            response_forwarding_ms = max(0.0, (response_returned - response_copy_started) * 1000.0)
+            recorder.record_duration(int(cycle_id), forwarding_prefix + ".total", request_forwarding_ms + response_forwarding_ms)
+        self._record_timing(cycle_id, stage_prefix + ".total", call_started)
+        return decoded_result
+
+    def _record_timing(self, cycle_id: int, stage: str, started: float) -> None:
+        """Record transport overhead without changing a component request or result."""
+        recorder = self.timing_recorder
+        if recorder is not None:
+            recorder.record_duration(int(cycle_id), str(stage), (time.perf_counter() - float(started)) * 1000.0)
 
 
 def cycle_id_from_timestamp(timestamp_s: float) -> int:
@@ -548,10 +614,41 @@ class RemoteGlobalPlannerProxy:
         self.context_client = ComponentClient(node, request_topic, result_topic, cache_operations=cache_operations, local_bus=local_bus)
         self.reference_client = ComponentClient(node, request_topic, result_topic, cache_operations=cache_operations, local_bus=local_bus)
         self.local_map_planner = local_map_planner
+        self.local_bus = local_bus
+        self.timing_recorder = getattr(node, "timing_recorder", None)
         self.name = str(getattr(local_map_planner, "name", "Town10HD_Opt.xodr"))
         self.blocked_lanes = []
         self.active_cycle_id = 0
         self.active_timestamp_s = 0.0
+
+    def _timed_local_call(self, operation, callback):
+        """Measure direct in-process map calls that do not cross the component topic bus."""
+        started = time.perf_counter()
+        try:
+            return callback()
+        finally:
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            recorder = self.timing_recorder or getattr(self.local_bus, "timing_recorder", None)
+            if recorder is not None:
+                prefix = "component.cpx.global_planner.local.{}".format(operation)
+                recorder.record_duration(int(self.active_cycle_id), prefix + ".node_execution", duration_ms)
+                recorder.record_duration(int(self.active_cycle_id), prefix + ".total", duration_ms)
+
+    def _timed_cached_local_call(self, operation, cache_key, callback):
+        """Reuse an identical static-map answer inside one cycle and record whether it was reused."""
+        if self.local_bus is None or int(self.active_cycle_id) <= 0:
+            return self._timed_local_call(operation, callback)
+        started = time.perf_counter()
+        result, cache_hit, execution_ms = self.local_bus.cached_map_call(int(self.active_cycle_id), cache_key, callback)
+        total_ms = (time.perf_counter() - started) * 1000.0
+        recorder = self.timing_recorder or getattr(self.local_bus, "timing_recorder", None)
+        if recorder is not None:
+            prefix = "component.cpx.global_planner.local.{}".format(operation)
+            recorder.record_duration(int(self.active_cycle_id), prefix + (".cache_hit" if cache_hit else ".cache_miss"), total_ms)
+            if not cache_hit:
+                recorder.record_duration(int(self.active_cycle_id), prefix + ".node_execution", execution_ms)
+            recorder.record_duration(int(self.active_cycle_id), prefix + ".total", total_ms)
+        return result
 
     def _call(self, operation, payload, *, cycle_id=0, timestamp_s=0.0, context=False):
         client = self.context_client if context else self.reference_client
@@ -563,12 +660,14 @@ class RemoteGlobalPlannerProxy:
 
     def get_waypoint(self, point):
         if self.local_map_planner is not None:
-            return self.local_map_planner.get_waypoint(_point_mapping(point))
+            point_mapping = _point_mapping(point)
+            cache_key = ("get_waypoint", float(point_mapping["x"]), float(point_mapping["y"]), float(point_mapping["z"]))
+            return self._timed_cached_local_call("get_waypoint", cache_key, lambda: self.local_map_planner.get_waypoint(point_mapping))
         return self._call("get_waypoint", {"point": _point_mapping(point)}, context=True)
 
     def get_local_lane_context(self, **kwargs):
         if self.local_map_planner is not None:
-            return self.local_map_planner.get_local_lane_context(**kwargs)
+            return self._timed_local_call("get_local_lane_context", lambda: self.local_map_planner.get_local_lane_context(**kwargs))
         return self._call("get_local_lane_context", kwargs, context=True)
 
     def plan_route_from_locations(self, **kwargs):
@@ -579,6 +678,19 @@ class RemoteGlobalPlannerProxy:
 
     def get_current_route_info(self, **kwargs):
         return self._call("get_current_route_info", kwargs)
+
+    def get_waypoint_candidates(self, point):
+        if self.local_map_planner is not None:
+            point_mapping = _point_mapping(point)
+            cache_key = ("get_waypoint_candidates", float(point_mapping["x"]), float(point_mapping["y"]), float(point_mapping["z"]))
+            return self._timed_cached_local_call("get_waypoint_candidates", cache_key, lambda: self.local_map_planner.get_waypoint_candidates(point_mapping))
+        return self._call("get_waypoint_candidates", {"point": _point_mapping(point)}, context=True)
+
+    def get_local_lane_graph(self, x_m, y_m, **kwargs):
+        payload = {"x_m": float(x_m), "y_m": float(y_m), **dict(kwargs)}
+        if self.local_map_planner is not None:
+            return self._timed_local_call("get_local_lane_graph", lambda: self.local_map_planner.get_local_lane_graph(**payload))
+        return self._call("get_local_lane_graph", payload, context=True)
 
     def block_ad_lane_id(self, ad_lane_id):
         result = self._call("block_ad_lane_id", {"ad_lane_id": int(ad_lane_id)})
@@ -786,12 +898,13 @@ def _point_mapping(point: Any) -> Dict[str, float]:
 
 
 def load_planner_configuration(package_root: Path) -> Dict[str, Any]:
-    """Load exactly the same copied planner YAML values for every separated node."""
+    """Load the shared planner configuration used by every separated node."""
     from cpx_planning.utility.config_loader import deep_merge_dicts, load_yaml_file
 
     planner_payload = load_yaml_file(str(package_root / "config" / "planner.yaml"))
     global_payload = load_yaml_file(str(package_root / "Global_Planner" / "global_planner.yaml"))
     planner_config = deep_merge_dicts(dict(planner_payload.get("planner", planner_payload)), dict(global_payload.get("global_planner", global_payload)))
+    planner_config["global_planner_mode"] = "dij"
     planner_config["mpc_config_path"] = str(package_root / "MPC" / "mpc.yaml")
     planner_config["cp_message_path"] = ""
     return planner_config

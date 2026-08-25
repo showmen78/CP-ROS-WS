@@ -9,6 +9,7 @@ from cpx_planning.component_interfaces import LocalComponentBus
 from cpx_planning.global_planner_node import GlobalPlannerNode
 from cpx_planning.mpc_node import MPCNode
 from cpx_planning.planner_node import CPXPlannerNode
+from cpx_planning.pipeline.performance_profiler import PlannerStageProfiler
 from cpx_planning.reference_planner_node import ReferencePlannerNode
 
 
@@ -22,10 +23,26 @@ def main(args=None):
     behavior_decision_node = BehaviorDecisionNode(local_bus=local_bus)
     reference_planner_node = ReferencePlannerNode(local_map_planner=global_planner_node.map_planner, local_bus=local_bus)
     planner_node = CPXPlannerNode(local_map_planner=global_planner_node.map_planner, local_bus=local_bus)
+    stage_profiler = PlannerStageProfiler(
+        enabled=bool(planner_node.debug_time),
+        external_recorder=lambda label, duration_ms: planner_node.timing_recorder.record_duration(0, label, duration_ms),
+    )
+    stage_profiler.instrument_global_planner(global_planner_node.map_planner)
+    stage_profiler.instrument_route_manager(global_planner_node.route_manager)
+    stage_profiler.instrument_reference_map(getattr(planner_node.planner_bridge, "reference_map", None))
+    stage_profiler.instrument_reference_map(getattr(reference_planner_node.bridge, "reference_map", None))
+    stage_profiler.instrument_bridge(planner_node.planner_bridge)
+    stage_profiler.instrument_bridge(reference_planner_node.bridge)
+    stage_profiler.instrument_mpc(mpc_node.mpc)
+    planner_node.stage_profiler = stage_profiler
     local_bus.mirror_markers = bool(planner_node.debug)
     local_bus.mirror_payloads = bool(planner_node.debug)
     nodes = [global_planner_node, mpc_node, behavior_context_node, behavior_decision_node, reference_planner_node, planner_node]
-    executor = MultiThreadedExecutor(num_threads=16)
+    # The planning stages are ordered and execute through the local component
+    # bus. Four workers are enough for the raw ROS callbacks and output topics;
+    # extra workers only contend for Python's interpreter lock while one CP-X
+    # cycle is running.
+    executor = MultiThreadedExecutor(num_threads=4)
     for node in nodes:
         executor.add_node(node)
     try:

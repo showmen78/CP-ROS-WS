@@ -1,11 +1,14 @@
 """Publish CP lane events as typed ROS messages."""
 
+import time
+
 from cpx_interfaces.msg import CooperativeMessageArray
 from cpx_interfaces.msg import LaneEvent
 import rclpy
 from rclpy.node import Node
 
 from .tcp_json_receiver import TcpJsonReceiver
+from .timing import configure_timing, publish_transport_timing
 
 
 # These tables turn the simple text received from OpenCDA into the
@@ -67,14 +70,14 @@ class CooperativeMessagePublisher(Node):
         )
 
         # Port 5055 is reserved for cooperative messages from OpenCDA.
-        self.receiver = TcpJsonReceiver(5055, self.get_logger())
-
-        # Check the TCP queue every 20 milliseconds without blocking ROS.
-        self.create_timer(0.02, self.publish_messages)
+        self.debug_time, self.timing_publisher, self.timing_stream = configure_timing(self, "cooperative")
+        self.message_guard = self.create_guard_condition(self.publish_messages)
+        self.receiver = TcpJsonReceiver(5055, self.get_logger(), on_message=self.message_guard.trigger)
 
     def publish_messages(self):
         """Convert every waiting CP JSON payload and publish it."""
         for data in self.receiver.get_messages():
+            publish_started_ns = time.time_ns()
             # The transmitter may wrap the useful part inside a "data" field.
             payload = data.get("data", data)
 
@@ -123,6 +126,7 @@ class CooperativeMessagePublisher(Node):
             # Traffic-light observations use their own perception topic. The
             # traffic_controls field therefore remains empty for now.
             self.publisher.publish(message)
+            publish_transport_timing(self.timing_publisher, data, self.timing_stream, publish_started_ns, time.time_ns())
 
     def destroy_node(self):
         self.receiver.close()

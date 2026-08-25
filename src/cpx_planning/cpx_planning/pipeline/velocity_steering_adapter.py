@@ -6,6 +6,18 @@ from dataclasses import dataclass
 import math
 from typing import Any, Optional
 
+# Reference tick length the max_*_delta config values below are expressed
+# against (CARLA's current fixed_delta_seconds). Steering was already rate
+# based (rad/s * dt_s, see run_step); throttle/brake used a flat per-call
+# delta instead, so their configured cap silently meant a different
+# physical rate of change whenever this adapter is driven at something
+# other than this reference tick rate (e.g. a real-vehicle actuator loop
+# running slower than CARLA's 20Hz). Dividing by this constant turns the
+# existing config values into a rate (per second), then multiplying by the
+# actual measured dt_s below reproduces today's exact behavior at the
+# reference rate and scales correctly at any other rate.
+_REFERENCE_DT_S = 0.05
+
 
 @dataclass(frozen=True)
 class VelocitySteeringCommand:
@@ -52,12 +64,12 @@ class CarlaVelocitySteeringAdapter:
         self.stop_hold_speed_mps = max(
             0.0, float(cfg.get("velocity_adapter_stop_hold_speed_mps", 0.08))
         )
-        self.max_throttle_delta = max(
+        self.max_throttle_delta_rate_per_s = max(
             0.0, float(cfg.get("velocity_adapter_max_throttle_delta", 0.08))
-        )
-        self.max_brake_delta = max(
+        ) / _REFERENCE_DT_S
+        self.max_brake_delta_rate_per_s = max(
             0.0, float(cfg.get("velocity_adapter_max_brake_delta", 0.05))
-        )
+        ) / _REFERENCE_DT_S
         self.max_steering_rate_rad_s = math.radians(max(
             0.0,
             float(cfg.get("velocity_adapter_max_steering_rate_deg_s", 25.0)),
@@ -174,12 +186,12 @@ class CarlaVelocitySteeringAdapter:
                 throttle = self._limit_delta(
                     throttle,
                     float(getattr(self._last_control, "throttle", 0.0)),
-                    self.max_throttle_delta,
+                    float(self.max_throttle_delta_rate_per_s) * float(dt_s),
                 )
                 brake = self._limit_delta(
                     brake,
                     float(getattr(self._last_control, "brake", 0.0)),
-                    self.max_brake_delta,
+                    float(self.max_brake_delta_rate_per_s) * float(dt_s),
                 )
             previous_steering_rad = (
                 float(getattr(self._last_control, "steer", 0.0))

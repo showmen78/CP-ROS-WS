@@ -1,140 +1,56 @@
-# Runtime rule-based behavior planner settings copied from new OpenCDA.
 behavior_planner_runtime:
   enabled: true
-
-  # Cooperative-message polling frequency [Hz]. The rule-based behavior
-  # planner checks cp_message.json at this rate. If one or more
-  # lane-closure messages are found in a poll, it batches them into a
-  # single reroute decision and removes them from the active message list.
   cooperative_message_check_frequency_hz: 0.5
-
-  # Minimum front-obstacle gap [m] for a non-zero lane-safety score.
-  lane_safety_distance_safe_m: 20.0 #12, 5
-
-  # Minimum rear-obstacle gap [m] for a non-zero lane-safety score.
-  lane_safety_rear_distance_safe_m: 3.0 #5
-
-  # Minimum front-obstacle TTC [s] for a non-zero lane-safety score.
-  lane_safety_ttc_safe_s: 3.0 #3,2
-
-  # Minimum rear-obstacle TTC [s] for a non-zero lane-safety score.
-  lane_safety_rear_ttc_safe_s: 1.0 #3
-
-  # Number of recent TTC samples kept for the linear-regression slope.
+  lane_safety_distance_safe_m: 20.0
+  lane_safety_rear_distance_safe_m: 3.0
+  lane_safety_ttc_safe_s: 3.0
+  lane_safety_rear_ttc_safe_s: 1.0
   lane_safety_ttc_history_length: 8
-
-  # Epsilon used in TTC = d / max(eps, closing_speed).
   lane_safety_ttc_epsilon_mps: 0.1
-
-  # Logistic gain used on the TTC slope term.
-  lane_safety_ttc_sigmoid_gain: 2 #2, 1.5
-
-  # Finite cap used when TTC is effectively infinite.
+  lane_safety_ttc_sigmoid_gain: 2
   lane_safety_infinite_ttc_cap_s: 15.0
-
-  # Switch from normal lane selection to maneuver-aware lane selection once
-  # the current lane is within this distance [m] of the next junction.
-  intersection_distance_threshold_m: 50.0 #30
-
-  # In both NORMAL and INTERSECTION mode, only start a new one-step lane
-  # change if the immediate target lane safety score is strictly greater
-  # than this. Otherwise the planner keeps following the current lane until
-  # that target lane becomes safe enough.
-  lane_change_target_safety_threshold: 0.65 # enter lane-change threshold
-
-  # During an ongoing lane change, if the target-lane safety score drops
-  # below this threshold and the previous lane becomes meaningfully safer,
-  # the behavior planner cancels the current lane change and returns to the
-  # previous lane.
+  intersection_distance_threshold_m: 50.0
+  lane_change_target_safety_threshold: 0.65
   lane_change_abort_safety_threshold: 0.35
-
-  # In NORMAL mode, leave the route-optimal lane only when that optimal
-  # lane drops below this safety score and there is an obstacle ahead on
-  # that lane. Once the route-optimal lane recovers to at least this score
-  # with no front obstacle, the planner will try to return to it.
-  optimal_lane_unsafe_threshold: 0.50
-
-  # In INTERSECTION mode, treat a front obstacle as moving only when its
-  # speed is above this threshold [m/s]. Moving obstacles reduce V_max to
-  # the obstacle speed; slower obstacles are treated as static blockers.
+  optimal_lane_unsafe_threshold: 0.5
   intersection_obstacle_moving_speed_threshold_mps: 0.5
-
-  # In INTERSECTION mode, trigger a static-obstacle global reroute only
-  # when the route-optimal lane safety score drops below this threshold.
+  intersection_static_obstacle_replan_enabled: true
   intersection_static_obstacle_replan_lane_safety_threshold: 0.5
-
-  # Minimum time [s] between consecutive static-obstacle route replans
-  # while the ego remains in INTERSECTION mode.
+  static_obstacle_replan_enabled: true
+  static_obstacle_replan_normal_mode_enabled: true
+  static_obstacle_local_avoidance_enabled: true
+  static_obstacle_local_lane_min_safety_score: 0.55
+  static_obstacle_global_replan_enabled: false
+  static_obstacle_local_avoidance_min_object_distance_m: 0.8
+  candidate_local_obstacle_stop_defer_cost: 25.0
+  lane_change_min_geometry_speed_mps: 2.0
+  lane_change_min_length_m: 10.0
+  static_obstacle_speed_threshold_mps: 0.5
+  static_obstacle_replan_lane_safety_threshold: 0.5
+  static_obstacle_blocked_confirm_s: 1.0
+  static_obstacle_replan_cooldown_s: 2.0
   intersection_static_obstacle_replan_cooldown_s: 1.0
-
-  # Hold duration [s] at a CP-message stop sign after ego reaches the stop point.
   stop_sign_wait_duration_s: 3.0
-
-  # Legacy compatibility key for emergency-brake following behavior.
   emergency_brake_follow_buffer_m: 3.0
-
-  # Hysteresis margin required before the planner leaves the current lane.
-  decision_hysteresis_delta: 0.10
-
-  # Candidate-evaluation cost weights used when scoring lane-change options.
-  # route_deviation_weight penalises lanes that are further from the global
-  # route's optimal lane; lane_change_weight adds a small friction cost per
-  # step away from the current ego lane, discouraging unnecessary changes.
+  decision_hysteresis_delta: 0.1
   candidate_route_deviation_weight: 0.15
-  candidate_lane_change_weight: 0.20
-
-  # Future-trajectory model used by behavior candidate risk checks when CP
-  # does not provide a predicted_trajectory. "constant_acceleration" uses
-  # a/acceleration_mps2/ax/ay if present and degenerates to CV if not.
+  candidate_lane_change_weight: 0.2
   lane_change_prediction_model: constant_acceleration
   lane_change_prediction_max_abs_acceleration_mps2: 4.0
-
-  # Minimum FSM state hold times [s]. Safety overrides such as emergency
-  # braking, traffic-light stops, and cooperative reroutes can still preempt.
-  # lane_keep_min_hold_s also acts as a cooldown after a lane-change is
-  # cancelled/completed before a new one can start, to avoid flickering
-  # between PREPARE_LC and LANE_KEEP when TTC-based lane safety scores are
-  # noisy near intersections with crossing traffic.
   prepare_lane_change_min_hold_s: 0.5
   execute_lane_change_min_hold_s: 1.0
   lane_keep_min_hold_s: 0.5
-
-  # Once EXECUTE_LANE_CHANGE_* has run past this many seconds, a target-lane
-  # safety-score dip alone no longer reverses the maneuver -- reversing after
-  # this much commitment costs more (an extra unwind) than finishing it.
-  # Prediction-risk aborts (imminent front/rear conflict) still apply
-  # regardless of commit time. Seen in town10_scenario_6: slow, congested
-  # execute phases were being reversed at ~3s on a soft safety-score dip
-  # after already covering ~45% of the lateral distance to the target lane.
   lane_change_safety_abort_commit_s: 2.0
-
-  # Lane change completion thresholds.
   lane_change_completion_lateral_threshold_m: 0.75
-  lane_change_completion_heading_threshold_rad: 0.20
+  lane_change_completion_heading_threshold_rad: 0.2
   lane_change_abort_cooldown_s: 8.0
   lane_change_commit_cooldown_s: 6.0
-
-  # Curvature-aware speed cap used by the runner before MPC solve.
-  # Lower -> more conservative cornering and less boundary pressure.
-  # 0.8 m/s² lateral-accel limit: at kappa=0.019 (the observed tight curve)
-  # caps speed at sqrt(0.8/0.019)=6.5 m/s (23 km/h) vs the previous 8.3 m/s
-  # (30 km/h) that caused the boundary breach in town10_scenario_6.
   curve_lateral_accel_limit_mps2: 0.5
-  # Lowered from 0.015 so the cap also activates on gentler bends.
-  curve_speed_cap_min_curvature: 0.010
-  # More forward samples catch the curvature peak earlier on approach.
+  curve_speed_cap_min_curvature: 0.01
   curve_speed_cap_sample_count: 12
-
-  # MPC horizon-reference continuity guard. The temporary destination can be
-  # stable while the per-stage lane reference still jumps; when the first
-  # reference sample jumps this far in a non-lane-change decision, keep the
-  # previous horizon instead of feeding the discontinuity into MPC.
   reference_stabilization_freeze_on_jump: true
   reference_stabilization_jump_threshold_m: 2.25
   reference_freeze_reanchor_after_replans: 4
-  # Lane-follow gets stricter reference filtering because even small
-  # first-sample jumps make the green MPC horizon visibly wiggle while the
-  # behavior state is otherwise steady.
   lane_follow_reference_min_first_forward_m: 1.0
   lane_follow_reference_guard_min_forward_m: 0.75
   lane_follow_reference_guard_max_lateral_m: 2.5
@@ -142,87 +58,33 @@ behavior_planner_runtime:
   lane_follow_reference_blend_alpha: 0.65
   lane_follow_reference_freeze_jump_threshold_m: 2.0
   lane_follow_destination_reference_forward_m: 6.0
-  # Geometry guards before feeding local goals/references into MPC.
-  # If the blue dot or first reference sample is far to the side while not
-  # changing lanes, re-anchor to a local lane-center/heading-safe target.
   temp_destination_min_forward_m: 3.0
   temp_destination_max_lateral_m: 4.5
   temp_destination_fallback_forward_m: 8.0
   reference_first_sample_min_forward_m: -0.5
   reference_first_sample_max_lateral_m: 4.5
-  # Keep the global route as a mission-level hint. The blue temp_des and MPC
-  # horizon should track locally generated lane/turn references instead of
-  # directly chasing raw global route samples, which can be behind ego or on
-  # a different junction connector after projection.
   temp_destination_allow_global_route_target: false
   mpc_allow_global_route_reference: false
   mpc_allow_global_route_reference_in_junction: false
-
-  # Limit how far the temporary destination is allowed to move in a single
-  # replan. The stop-specific cap applies when a stop target becomes active;
-  # the generic cap applies to ordinary lane-follow/release updates so the
-  # blue point does not jump across a junction connector in one frame.
   temp_destination_max_step_m: 6.0
   stop_target_max_destination_step_m: 5.0
   stop_profile_braking_deceleration_mps2: 1.2
-  # Caps below (IDM, stop profile, curvature, reference-jump) are each
-  # recomputed from scratch every cycle and combined by taking the
-  # tightest. When the binding one is noisy (e.g. IDM reacting to a lead
-  # vehicle's fluctuating gap near an intersection), the combined cap can
-  # swing down and back up by several m/s within a couple of ticks, which
-  # reads to the MPC as alternating hard-brake/floor-it commands and shows
-  # up as exaggerated corrective steering once the vehicle drifts during
-  # the jerk. This only rate-limits how fast the cap may *rise* back up;
-  # a cap that needs to drop (new obstacle, tighter stop, emergency brake)
-  # always applies immediately.
   speed_cap_rise_limit_mps2: 2.0
-  # Desired standstill buffer before a traffic stop target. Keep this small:
-  # a large value (e.g. 5m) makes the speed cap hit zero while the ego is
-  # still visibly far from the stop line, which looks like the vehicle is
-  # stuck before the intersection.
   stop_profile_buffer_m: 1.5
-  # Broad lane-follow speed guard for nearby predicted objects in ego's
-  # forward corridor. This complements lane-assigned IDM: if an NPC is
-  # crossing or misassigned, the speed layer can still slow the vehicle
-  # before behavior changes mode.
   ego_corridor_obstacle_speed_cap_horizon_s: 2.5
   ego_corridor_obstacle_lateral_margin_m: 2.6
   ego_corridor_obstacle_max_forward_m: 35.0
   ego_corridor_obstacle_behind_tolerance_m: 2.0
   ego_corridor_obstacle_stop_buffer_m: 8.0
   ego_corridor_obstacle_braking_deceleration_mps2: 2.5
-
-  # Minimum time [s] to keep a non-emergency MPC cost profile before allowing
-  # another profile switch. Stop/recovery can still preempt immediately.
   mpc_cost_profile_min_hold_s: 1.5
-
-  # Involuntary-standstill recovery timeout [s].
-  # If the ego has been stationary this long while NOT in a voluntary stop
-  # (stop_sign / traffic-light), the runner forces an MPC seed reset and a
-  # full behavior replan.  A separate longer timeout applies when the planner
-  # is in emergency_brake (the obstacle may still be present).
   standstill_recovery_timeout_s: 15.0
   standstill_emergency_brake_recovery_timeout_s: 30.0
-  # After a collision sensor event, briefly hold brake and clear the MPC
-  # seed so the controller does not continue to apply throttle into the
-  # object it just hit.
   collision_recovery_hold_s: 2.0
   collision_recovery_brake: 1.0
-
-  # CARLA-native traffic-light stopping logic.
-  #
-  # Enabled: the runner calls find_stop_target_from_ego + find_relevant_signal_context
-  # each tick to detect red/yellow signals within search_distance_m and build a
-  # stop target at the stop line.  The planner latches `stop` on red and releases
-  # it when the signal turns green or the ego enters the junction.
   traffic_light_stop:
     enabled: true
     search_distance_m: 60.0
     stop_buffer_m: 2.0
-    # If a light briefly disappears at a CARLA trigger-volume boundary, keep
-    # the last reliable state only for this short window.  Red is remembered
-    # only while a current stop target still exists.
     unknown_hold_s: 0.75
-    # After this much continuous unknown with no valid stop target, release a
-    # traffic-light stop latch instead of staying stopped on a phantom red.
     unknown_release_s: 2.0

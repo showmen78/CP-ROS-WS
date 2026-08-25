@@ -3,7 +3,19 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Callable, Mapping, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
+
+# Reference tick length max_*_delta below are expressed against (CARLA's
+# current fixed_delta_seconds). These were flat per-call deltas with no
+# time awareness, so the physical rate of change they actually enforced
+# silently depended on how often filter_control() got called -- correct at
+# this reference rate, wrong (roughly proportionally so) at any other rate,
+# e.g. a real-vehicle actuator loop running slower than CARLA's 20Hz.
+# Dividing by this constant turns the existing config values into a rate
+# (per second); filter_control() multiplies by the actual measured dt_s
+# between calls, reproducing today's exact behavior at the reference rate
+# and scaling correctly at any other rate.
+_REFERENCE_DT_S = 0.05
 
 
 class SafetySupervisor:
@@ -19,13 +31,14 @@ class SafetySupervisor:
         stuck_release_min_accel_mps2: float = 0.01,
     ) -> None:
         self.enabled = bool(enabled)
-        self.max_steer_delta = max(0.0, float(max_steer_delta))
-        self.max_throttle_delta = max(0.0, float(max_throttle_delta))
-        self.max_brake_delta = max(0.0, float(max_brake_delta))
+        self.max_steer_delta_rate_per_s = max(0.0, float(max_steer_delta)) / _REFERENCE_DT_S
+        self.max_throttle_delta_rate_per_s = max(0.0, float(max_throttle_delta)) / _REFERENCE_DT_S
+        self.max_brake_delta_rate_per_s = max(0.0, float(max_brake_delta)) / _REFERENCE_DT_S
         self.stuck_release_min_accel_mps2 = max(
             0.0, float(stuck_release_min_accel_mps2)
         )
         self._last_control = None
+        self._last_filter_time_s: Optional[float] = None
         self._turn_boundary_hard_stop_frames = 0
         self._turn_boundary_recovery_active = False
         self._turn_boundary_recovery_phase = ""
@@ -392,8 +405,22 @@ class SafetySupervisor:
         traffic_signal_state: str = "",
         stop_goal_active: bool = False,
         planner_accel_mps2: float = 0.0,
+        sim_time_s: Optional[float] = None,
     ) -> Tuple[Any, str]:
         del input_frame
+        # sim_time_s is optional so existing callers that never pass it
+        # keep today's exact behavior (dt_s pinned to the reference tick);
+        # callers that do pass it get the delta caps below correctly
+        # scaled to however often filter_control() is actually invoked.
+        if sim_time_s is None:
+            dt_s = _REFERENCE_DT_S
+        else:
+            dt_s = (
+                _REFERENCE_DT_S
+                if self._last_filter_time_s is None
+                else max(1.0e-3, min(0.2, float(sim_time_s) - float(self._last_filter_time_s)))
+            )
+            self._last_filter_time_s = float(sim_time_s)
         if not bool(self.enabled):
             self._last_control = control
             return control, ""
@@ -422,17 +449,17 @@ class SafetySupervisor:
             throttle=self._limit_delta(
                 float(getattr(control, "throttle", 0.0)),
                 float(getattr(self._last_control, "throttle", 0.0)),
-                self.max_throttle_delta,
+                float(self.max_throttle_delta_rate_per_s) * float(dt_s),
             ),
             brake=self._limit_delta(
                 float(getattr(control, "brake", 0.0)),
                 float(getattr(self._last_control, "brake", 0.0)),
-                self.max_brake_delta,
+                float(self.max_brake_delta_rate_per_s) * float(dt_s),
             ),
             steer=self._limit_delta(
                 float(getattr(control, "steer", 0.0)),
                 float(getattr(self._last_control, "steer", 0.0)),
-                self.max_steer_delta,
+                float(self.max_steer_delta_rate_per_s) * float(dt_s),
             ),
         )
         rate_limited = (
@@ -518,6 +545,7 @@ class SafetySupervisor:
             "stop_at_intersection",
             "stop_sign",
             "emergency_brake",
+            "static_obstacle_stop",
         }
         turn_like = normalized_behavior in {
             "intersection_turn_left",

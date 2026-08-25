@@ -8,7 +8,9 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     debug = LaunchConfiguration("debug")
+    debug_time = LaunchConfiguration("debug_time")
     return LaunchDescription([
         DeclareLaunchArgument("debug", default_value="false"),
-        Node(package="cpx_planning", executable="planning_system", output="screen", parameters=[{"debug": debug, "planning_period_s": 0.05}]),
+        DeclareLaunchArgument("debug_time", default_value="false"),
+        Node(package="cpx_planning", executable="planning_system", output="screen", parameters=[{"debug": debug, "debug_time": debug_time}]),
     ])

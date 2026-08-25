@@ -75,6 +75,7 @@ _ABORT_LANE_CHANGE = "ABORT_LANE_CHANGE"
 _CANCEL_LANE_CHANGE = "CANCEL_LANE_CHANGE"
 _REROUTE_STATE = "REROUTE"
 _STOP_STATE = "STOP"
+_STATIC_OBSTACLE_STOP_STATE = "STATIC_OBSTACLE_STOP"
 _YIELD_STATE = "YIELD"
 
 # Compatibility aliases used internally by older helper names.
@@ -89,6 +90,7 @@ _DECISION_REROUTE = "reroute"
 _DECISION_STOP_AT_INTERSECTION = "stop_at_intersection"
 _DECISION_STOP_SIGN = "stop_sign"
 _DECISION_EMERGENCY_BRAKE = "emergency_brake"
+_DECISION_STATIC_OBSTACLE_STOP = "static_obstacle_stop"
 
 _MANEUVER_LEFT = "left"
 _MANEUVER_RIGHT = "right"
@@ -144,6 +146,12 @@ def normalize_behavior_decision(decision: str | None) -> str:
         "EMERGENCY",
     }:
         return _DECISION_EMERGENCY_BRAKE
+    if normalized_name in {
+        "STATIC_OBSTACLE_STOP",
+        "STATIC_BLOCKED",
+        "BLOCKED_WAIT",
+    }:
+        return _DECISION_STATIC_OBSTACLE_STOP
     if normalized_name in {"LANE_KEEP", "KEEP_LANE", "KEEP"}:
         return _DECISION_FOLLOW
     return _DECISION_FOLLOW
@@ -157,7 +165,17 @@ def is_fixed_stop_decision(decision: str | None) -> bool:
 
 
 def is_stop_decision(decision: str | None) -> bool:
-    return bool(is_fixed_stop_decision(decision))
+    return bool(
+        is_fixed_stop_decision(decision)
+        or is_static_obstacle_stop_decision(decision)
+    )
+
+
+def is_static_obstacle_stop_decision(decision: str | None) -> bool:
+    return (
+        str(normalize_behavior_decision(decision))
+        == _DECISION_STATIC_OBSTACLE_STOP
+    )
 
 
 def is_emergency_brake_decision(decision: str | None) -> bool:
@@ -200,7 +218,11 @@ def _behavior_command_invariant_violations(
         return violations
 
     if (
-        (is_fixed_stop_decision(decision) or is_emergency_brake_decision(decision))
+        (
+            is_fixed_stop_decision(decision)
+            or is_static_obstacle_stop_decision(decision)
+            or is_emergency_brake_decision(decision)
+        )
         and int(target_lane_id) != int(ego_lane_id)
     ):
         violations.append({
@@ -545,7 +567,9 @@ class RuleBasedBehaviorPlanner:
         nearest_front_obstacles_by_lane: Mapping[int, Mapping[str, object]] | None = None,
         lane_prediction_risks: Mapping[int, Mapping[str, object]] | None = None,
         preferred_target_lane_id: int | None = None,
+        local_avoidance_target_lane_id: int | None = None,
         lane_change_completion_allowed: bool = True,
+        static_obstacle_stop_active: bool = False,
     ) -> BehaviorCommand:
         """
         Run one planning cycle.
@@ -584,6 +608,11 @@ class RuleBasedBehaviorPlanner:
                                  the strategy layer. The FSM still validates
                                  safety and prediction risk before preparing
                                  or executing a lane change.
+        local_avoidance_target_lane_id : confirmed static-obstacle bypass lane.
+                                 Unlike a generic preference, this is an
+                                 explicit maneuver request and may enter
+                                 EXECUTE immediately after the same lane-safety
+                                 and prediction checks pass.
         lane_change_completion_allowed : false while the downstream maneuver
                                  manager still owns a locked lane-change
                                  trajectory. This keeps both state machines on
@@ -592,7 +621,8 @@ class RuleBasedBehaviorPlanner:
         Returns
         -------
         {"decision": "lane_follow" | "lane_change_left" | "lane_change_right" | "reroute" |
-                     "stop_at_intersection" | "stop_sign" | "emergency_brake",
+                     "stop_at_intersection" | "stop_sign" | "static_obstacle_stop" |
+                     "emergency_brake",
          "target_lane_id": int,
          "lc_state": str}
         """
@@ -637,6 +667,11 @@ class RuleBasedBehaviorPlanner:
             _YIELD_STATE,
         }:
             self._reset_lane_change_state(reason="reset")
+        if (
+            str(self._lc_state) == _STATIC_OBSTACLE_STOP_STATE
+            and not bool(static_obstacle_stop_active)
+        ):
+            self._reset_lane_change_state(reason="static_obstacle_cleared")
 
         planner_mode = str(mode or "NORMAL").strip().upper()
         if str(planner_mode) != str(self._last_mode):
@@ -711,6 +746,31 @@ class RuleBasedBehaviorPlanner:
             current_time_s=current_time_s,
             wall_time_s=wall_time_s,
         )
+
+        if bool(static_obstacle_stop_active):
+            self._set_transition_reason("static_obstacle_replan_failed")
+            self._lc_state = _STATIC_OBSTACLE_STOP_STATE
+            self._target_lane_id = None
+            self._source_lane_id = None
+            self._selected_lane_id = int(ego_lane_id)
+            self._clear_stop_state()
+            self._simple_candidate_evaluation(
+                selected_candidate="static_obstacle_stop",
+                decision=_DECISION_STATIC_OBSTACLE_STOP,
+                target_lane_id=int(ego_lane_id),
+                reason="static_obstacle_replan_failed",
+                rejected_reasons={
+                    "lane_keep": "static_obstacle_blocks_route",
+                    "lane_change_left": "global_replan_failed",
+                    "lane_change_right": "global_replan_failed",
+                },
+            )
+            return self._make_result(
+                _DECISION_STATIC_OBSTACLE_STOP,
+                int(ego_lane_id),
+                traffic_light_debug=traffic_light_debug,
+            )
+
         if stop_result is not None:
             self._set_transition_reason("traffic_or_cp_stop")
             self._lc_state = _STOP_STATE
@@ -756,6 +816,52 @@ class RuleBasedBehaviorPlanner:
                 },
             )
             return self._attach_current_candidate_evaluation(emergency_brake_result)
+
+        # A confirmed local obstacle bypass is a maneuver request, not merely
+        # a scoring hint.  Sending it through generic PREPARE used to create a
+        # circular gate: PREPARE outputs lane_follow, while the downstream
+        # candidate pipeline only builds a lane-change reference after seeing
+        # lane_change_left/right.  Enter EXECUTE here once the target lane has
+        # already passed lane-safety and prediction checks. Traffic-control
+        # stops and emergency braking above retain higher priority.
+        if (
+            local_avoidance_target_lane_id is not None
+            and int(local_avoidance_target_lane_id) != int(ego_lane_id)
+            and not self._is_prepare_lane_change_state()
+            and not self._is_execute_lane_change_state()
+        ):
+            local_avoidance_result = self._start_one_step_lane_change(
+                ego_lane_id=int(ego_lane_id),
+                desired_lane_id=int(local_avoidance_target_lane_id),
+                available_lane_ids=available,
+                lane_safety_scores=lane_safety_scores,
+                min_target_lane_safety=self._target_lane_safety_threshold,
+                lane_prediction_risks=lane_prediction_risks,
+                traffic_light_debug=dict(
+                    dict(traffic_light_debug or {}),
+                    local_static_obstacle_avoidance=True,
+                    local_avoidance_target_lane_id=int(
+                        local_avoidance_target_lane_id
+                    ),
+                ),
+                immediate_execute=True,
+            )
+            if str(local_avoidance_result.get("decision", "")) in {
+                _DECISION_CHANGE_LEFT,
+                _DECISION_CHANGE_RIGHT,
+            }:
+                self._simple_candidate_evaluation(
+                    selected_candidate="static_obstacle_local_lane_borrow",
+                    decision=str(local_avoidance_result["decision"]),
+                    target_lane_id=int(local_avoidance_result["target_lane_id"]),
+                    reason="confirmed_static_obstacle_local_avoidance",
+                    rejected_reasons={
+                        "lane_keep": "confirmed_static_obstacle_blocks_current_lane",
+                    },
+                )
+                return self._attach_current_candidate_evaluation(
+                    local_avoidance_result
+                )
 
         if len(lane_safety_scores) == 0:
             self._simple_candidate_evaluation(
@@ -963,6 +1069,7 @@ class RuleBasedBehaviorPlanner:
                 lane_safety_scores=lane_safety_scores,
                 traffic_stop_target=traffic_stop_target,
                 traffic_light_debug=traffic_light_debug,
+                available_lane_ids=available,
             )
             if blocked_optimal_lane_result is not None:
                 return blocked_optimal_lane_result
@@ -990,10 +1097,10 @@ class RuleBasedBehaviorPlanner:
                     ),
                     self._candidate_record(
                         name="intersection_route_lane_change",
-                        decision=(
-                            _DECISION_CHANGE_LEFT
-                            if int(desired_lane_id) > int(ego_lane_id)
-                            else _DECISION_CHANGE_RIGHT
+                        decision=self._display_lane_change_direction(
+                            desired_lane_id=int(desired_lane_id),
+                            ego_lane_id=int(ego_lane_id),
+                            available_lane_ids=available,
                         ),
                         target_lane_id=int(desired_lane_id),
                         cost=max(0.0, 1.0 - float(lane_safety_scores.get(int(desired_lane_id), 0.0))),
@@ -2289,6 +2396,7 @@ class RuleBasedBehaviorPlanner:
         lane_safety_scores: Mapping[int, float],
         traffic_stop_target: Mapping[str, object] | None,
         traffic_light_debug: Mapping[str, object] | None = None,
+        available_lane_ids: Sequence[int] | None = None,
     ) -> Dict[str, Any] | None:
         if int(desired_lane_id) == int(ego_lane_id):
             return None
@@ -2318,10 +2426,10 @@ class RuleBasedBehaviorPlanner:
                 rejected_candidates=[
                     self._candidate_record(
                         name="intersection_route_lane_change",
-                        decision=(
-                            _DECISION_CHANGE_LEFT
-                            if int(desired_lane_id) > int(ego_lane_id)
-                            else _DECISION_CHANGE_RIGHT
+                        decision=self._display_lane_change_direction(
+                            desired_lane_id=int(desired_lane_id),
+                            ego_lane_id=int(ego_lane_id),
+                            available_lane_ids=available_lane_ids,
                         ),
                         target_lane_id=int(desired_lane_id),
                         cost=1.0e6,
@@ -2415,10 +2523,10 @@ class RuleBasedBehaviorPlanner:
             rejected_candidates=[
                 self._candidate_record(
                     name="intersection_route_lane_change",
-                    decision=(
-                        _DECISION_CHANGE_LEFT
-                        if int(desired_lane_id) > int(ego_lane_id)
-                        else _DECISION_CHANGE_RIGHT
+                    decision=self._display_lane_change_direction(
+                        desired_lane_id=int(desired_lane_id),
+                        ego_lane_id=int(ego_lane_id),
+                        available_lane_ids=available_lane_ids,
                     ),
                     target_lane_id=int(desired_lane_id),
                     cost=1.0e6,
@@ -2457,6 +2565,46 @@ class RuleBasedBehaviorPlanner:
                 key=lambda lane_id: abs(int(lane_id) - int(normalized_route_lane_id)),
             )
         )
+
+    @staticmethod
+    def _display_lane_change_direction(
+        *,
+        desired_lane_id: int,
+        ego_lane_id: int,
+        available_lane_ids: Sequence[int] | None,
+    ) -> str:
+        """Return the debug/candidate-record direction label for a target.
+
+        `_start_one_step_lane_change`/`_adjacent_lane_id` decide the actual
+        executed direction by position within this tick's freshly-built
+        `available_lane_ids` (rightmost-to-leftmost), not by comparing raw
+        id magnitudes -- that stays correct even when ego_lane_id (a
+        StableLaneIdTracker-held, cross-tick id) no longer numerically
+        lines up with a fresh recount. The `_candidate_record` calls that
+        only feed debug/candidate-evaluation display used the raw-magnitude
+        comparison directly, so a rejected or informational candidate's
+        shown decision could disagree with what would actually be driven.
+        Mirror the same position-based check here so the label always
+        matches; only fall back to raw magnitude when either id is absent
+        from the available list (e.g. a stale snapshot), same as
+        `_adjacent_lane_id`'s own guard.
+        """
+        ordered_lane_ids = [
+            int(lane_id)
+            for lane_id in list(available_lane_ids or [])
+            if int(lane_id) != 0
+        ]
+        if (
+            int(ego_lane_id) in ordered_lane_ids
+            and int(desired_lane_id) in ordered_lane_ids
+        ):
+            is_left = (
+                ordered_lane_ids.index(int(desired_lane_id))
+                > ordered_lane_ids.index(int(ego_lane_id))
+            )
+        else:
+            is_left = int(desired_lane_id) > int(ego_lane_id)
+        return _DECISION_CHANGE_LEFT if is_left else _DECISION_CHANGE_RIGHT
 
     @staticmethod
     def _adjacent_lane_id(
@@ -2543,6 +2691,7 @@ class RuleBasedBehaviorPlanner:
         min_target_lane_safety: float | None = None,
         lane_prediction_risks: Mapping[int, Mapping[str, object]] | None = None,
         traffic_light_debug: Mapping[str, object] | None = None,
+        immediate_execute: bool = False,
     ) -> Dict[str, Any]:
         ordered_lane_ids = [
             int(lane_id)
@@ -2622,7 +2771,9 @@ class RuleBasedBehaviorPlanner:
                 traffic_light_debug=risk_debug,
             )
 
-        if self._current_update_time_s is None and lane_prediction_risks is None:
+        if bool(immediate_execute) or (
+            self._current_update_time_s is None and lane_prediction_risks is None
+        ):
             return self._enter_execute_lane_change_state(
                 decision=str(decision),
                 target_lane_id=int(target_lane_id),

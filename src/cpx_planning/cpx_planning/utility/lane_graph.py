@@ -129,6 +129,17 @@ def _lane_identity_key(waypoint) -> tuple[int, int]:
     )
 
 
+def _waypoint_xy(waypoint) -> tuple[float, float]:
+    """Read waypoint XY without requiring a simulator transform."""
+    position = getattr(waypoint, "position", None)
+    if isinstance(position, Mapping):
+        return float(position.get("x", 0.0)), float(position.get("y", 0.0))
+    location = getattr(getattr(waypoint, "transform", None), "location", None)
+    if location is None:
+        raise TypeError("Waypoint position is unavailable.")
+    return float(location.x), float(location.y)
+
+
 def lane_hop_offset(from_waypoint, to_waypoint, max_hops: int = 8) -> int | None:
     """Count the signed ``left()``/``right()`` hops from
     ``from_waypoint`` to the same physical lane as ``to_waypoint``.
@@ -203,11 +214,17 @@ class StableLaneIdTracker:
     same physical lane, independent of how many lanes exist locally.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, discontinuity_confirm_frames: int = 3) -> None:
         self._lane_id: int | None = None
         self._waypoint = None
+        self._pending_waypoint = None
+        self._pending_key = None
+        self._pending_frames = 0
+        self._discontinuity_confirm_frames = max(
+            1, int(discontinuity_confirm_frames)
+        )
 
-    def update(self, waypoint) -> int:
+    def update(self, waypoint, *, on_discontinuity=None) -> int:
         if waypoint is None:
             return int(self._lane_id or 1)
         if self._waypoint is not None and self._lane_id is not None:
@@ -215,7 +232,50 @@ class StableLaneIdTracker:
             if hop is not None:
                 self._lane_id = int(self._lane_id) + int(hop)
                 self._waypoint = waypoint
+                self._pending_waypoint = None
+                self._pending_key = None
+                self._pending_frames = 0
                 return int(self._lane_id)
+            # `lane_hop_offset` could not prove adjacency (most commonly a
+            # road_id boundary -- it never walks next()/previous(), only
+            # get_left_lane()/get_right_lane(), see its docstring). The id
+            # is about to be re-anchored from a fresh local count below,
+            # which silently loses continuity: report it before that
+            # happens so callers can log/measure how often this occurs,
+            # without this tracker itself changing behavior.
+            pending_key = _lane_identity_key(waypoint)
+            try:
+                previous_x_m, previous_y_m = _waypoint_xy(self._waypoint)
+                new_x_m, new_y_m = _waypoint_xy(waypoint)
+                discontinuity_distance_m = math.hypot(float(new_x_m) - float(previous_x_m), float(new_y_m) - float(previous_y_m))
+            except Exception:
+                discontinuity_distance_m = 0.0
+            # A large jump is a teleport/respawn, not CARLA's overlapping
+            # road projection ambiguity. Re-anchor immediately so stale lane
+            # state cannot survive a vehicle reset.
+            immediate_reanchor = bool(discontinuity_distance_m > 15.0)
+            if pending_key == self._pending_key:
+                self._pending_frames += 1
+            else:
+                self._pending_key = pending_key
+                self._pending_waypoint = waypoint
+                self._pending_frames = 1
+            # CARLA can alternate between overlapping connector/road
+            # waypoints for one or two ticks without any lateral motion.
+            # Debounce only this unprovable transition; real left/right hops
+            # above remain immediate.  A persistent road transition is
+            # re-anchored after the confirmation window.
+            if (
+                not bool(immediate_reanchor)
+                and self._pending_frames < self._discontinuity_confirm_frames
+            ):
+                return int(self._lane_id)
+            if on_discontinuity is not None:
+                on_discontinuity(
+                    previous_waypoint=self._waypoint,
+                    previous_lane_id=int(self._lane_id),
+                    new_waypoint=waypoint,
+                )
         # First update, or the vehicle's raw lane is not connected to the
         # previously tracked one within a few hops (e.g. it just completed
         # a turn onto a cross street, or was respawned/teleported): there is
@@ -223,11 +283,17 @@ class StableLaneIdTracker:
         fresh_id = int(canonical_lane_id_for_waypoint(waypoint)) or 1
         self._lane_id = int(fresh_id)
         self._waypoint = waypoint
+        self._pending_waypoint = None
+        self._pending_key = None
+        self._pending_frames = 0
         return int(self._lane_id)
 
     def reset(self) -> None:
         self._lane_id = None
         self._waypoint = None
+        self._pending_waypoint = None
+        self._pending_key = None
+        self._pending_frames = 0
 
 
 def canonical_lane_waypoint_for_lane_id(waypoint, target_lane_id: int):

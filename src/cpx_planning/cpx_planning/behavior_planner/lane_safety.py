@@ -34,6 +34,8 @@ DEFAULT_REAR_D_SAFE_M = DEFAULT_D_SAFE_M
 DEFAULT_REAR_TTC_SAFE_S = DEFAULT_TTC_SAFE_S
 DEFAULT_TTC_EPSILON_MPS = 0.1
 DEFAULT_INFINITE_TTC_CAP_S = 15.0
+DEFAULT_STANDSTILL_BUFFER_M = 2.0
+DEFAULT_CLOSING_TIME_HEADWAY_S = 1.5
 
 
 # --------------------------------------------------------------------- #
@@ -52,6 +54,8 @@ class LaneSafetyScorer:
         ttc_history_size: int = DEFAULT_TTC_HISTORY_SIZE,
         ttc_epsilon_mps: float = DEFAULT_TTC_EPSILON_MPS,
         infinite_ttc_cap_s: float = DEFAULT_INFINITE_TTC_CAP_S,
+        standstill_buffer_m: float = DEFAULT_STANDSTILL_BUFFER_M,
+        closing_time_headway_s: float = DEFAULT_CLOSING_TIME_HEADWAY_S,
     ) -> None:
         self._front_d_safe_m = max(0.0, float(d_safe_m))
         self._rear_d_safe_m = max(0.0, float(rear_d_safe_m))
@@ -61,6 +65,11 @@ class LaneSafetyScorer:
         self._ttc_history_size = int(ttc_history_size)
         self._ttc_epsilon_mps = max(_EPS, float(ttc_epsilon_mps))
         self._infinite_ttc_cap_s = max(1.0, float(infinite_ttc_cap_s))
+        # IDM/RSS-style: the buffer a stationary obstacle needs is small;
+        # the buffer a fast-closing obstacle needs is large. See
+        # _effective_safe_distance_m.
+        self._standstill_buffer_m = max(0.0, float(standstill_buffer_m))
+        self._closing_time_headway_s = max(0.0, float(closing_time_headway_s))
         # obstacle_id -> deque of (timestamp_s, ttc_s)
         self._ttc_history: Dict[str, deque] = {}
 
@@ -156,6 +165,26 @@ class LaneSafetyScorer:
         # Trend is only a small correction; it should not dominate distance/TTC.
         return self._clamp_unit_interval(0.85 + 0.15 * float(trend_sigmoid), default=1.0)
 
+    def _effective_safe_distance_m(
+        self, base_safe_distance_m: float, delta_v_mps: float
+    ) -> float:
+        """Required buffer scales with closing speed, not a flat constant.
+
+        Two vehicles at zero (or negative -- separating) relative speed are
+        not on a collision course no matter how close they are; the risk
+        ``base_safe_distance_m`` guards against only exists once one is
+        actually closing on the other (IDM/RSS-style: buffer = standstill
+        gap + time_headway * closing_speed). Capped at
+        ``base_safe_distance_m`` so this only ever relaxes today's
+        requirement for a slow/non-closing obstacle -- it never demands
+        more distance than before for one that is genuinely closing fast.
+        """
+        closing_speed_mps = max(0.0, float(delta_v_mps))
+        dynamic_distance_m = float(self._standstill_buffer_m) + float(
+            self._closing_time_headway_s
+        ) * closing_speed_mps
+        return float(min(float(base_safe_distance_m), dynamic_distance_m))
+
     def _obstacle_score(
         self,
         distance_m: float,
@@ -164,12 +193,16 @@ class LaneSafetyScorer:
         *,
         safe_distance_m: float,
         safe_ttc_s: float,
+        delta_v_mps: float = 0.0,
     ) -> float:
         """S_obs in [0, 1]."""
         if not math.isfinite(float(distance_m)):
             return 1.0
 
-        safe_distance_m = max(_EPS, float(safe_distance_m))
+        safe_distance_m = max(
+            _EPS,
+            self._effective_safe_distance_m(float(safe_distance_m), float(delta_v_mps)),
+        )
         safe_ttc_s = max(_EPS, float(safe_ttc_s))
 
         # Only an imminent collision risk should clamp to zero.
@@ -272,6 +305,7 @@ class LaneSafetyScorer:
                         slope,
                         safe_distance_m=float(self._front_d_safe_m),
                         safe_ttc_s=float(self._front_ttc_safe_s),
+                        delta_v_mps=float(delta_v),
                     )
                 else:
                     delta_v = obs_v - ego_v
@@ -284,6 +318,7 @@ class LaneSafetyScorer:
                         slope,
                         safe_distance_m=float(self._rear_d_safe_m),
                         safe_ttc_s=float(self._rear_ttc_safe_s),
+                        delta_v_mps=float(delta_v),
                     )
 
                 lane_score = min(float(lane_score), float(obstacle_score))

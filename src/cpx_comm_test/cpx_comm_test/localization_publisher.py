@@ -1,6 +1,7 @@
 """Publish OpenCDA localization output as ROS 2 odometry."""
 
 import math
+import time
 
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped
@@ -8,6 +9,7 @@ import rclpy
 from rclpy.node import Node
 
 from .tcp_json_receiver import TcpJsonReceiver
+from .timing import configure_timing, publish_transport_timing
 
 
 def _set_stamp(stamp, timestamp_s):
@@ -36,11 +38,13 @@ class LocalizationPublisher(Node):
             "/cpx/final_destination",
             10,
         )
-        self.receiver = TcpJsonReceiver(5051, self.get_logger())
-        self.create_timer(0.02, self.publish_messages)
+        self.debug_time, self.timing_publisher, self.timing_stream = configure_timing(self, "localization")
+        self.message_guard = self.create_guard_condition(self.publish_messages)
+        self.receiver = TcpJsonReceiver(5051, self.get_logger(), on_message=self.message_guard.trigger)
 
     def publish_messages(self):
         for data in self.receiver.get_messages():
+            publish_started_ns = time.time_ns()
             payload = data.get("data", data)
             ego_state = payload.get("ego_state", {})
 
@@ -98,6 +102,8 @@ class LocalizationPublisher(Node):
                 destination_message.pose.orientation.w = 1.0
 
                 self.destination_publisher.publish(destination_message)
+
+            publish_transport_timing(self.timing_publisher, data, self.timing_stream, publish_started_ns, time.time_ns())
 
 
     def destroy_node(self):

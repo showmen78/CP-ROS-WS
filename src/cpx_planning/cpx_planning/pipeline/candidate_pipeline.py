@@ -54,7 +54,7 @@ class CandidateReferenceResult:
         contract_reason = ""
         if self.contract_result is not None and not bool(self.contract_result.valid):
             contract_reason = str(self.contract_result.reason())
-        return {
+        row = {
             "name": str(self.intent.name),
             "decision": str(self.intent.decision),
             "target_lane_id": int(self.intent.target_lane_id),
@@ -66,7 +66,16 @@ class CandidateReferenceResult:
             "feasibility_reason": str(self.feasibility_reason),
             "contract_reason": str(contract_reason),
             "total_cost": float(self.total_cost),
+            "reference_point_count": len(list(self.lane_center_reference or [])),
         }
+        if self.contract_result is not None:
+            row["debug_max_curvature_1pm"] = float(
+                getattr(self.contract_result, "max_curvature_1pm", -1.0)
+            )
+            row["debug_contract_max_curvature_1pm"] = float(
+                getattr(self.contract_result, "contract_max_curvature_1pm", -1.0)
+            )
+        return row
 
 
 @dataclass(frozen=True)
@@ -200,8 +209,11 @@ def build_candidate_intents(
     lane_change_normal_speed_scale: float = 0.9,
     lane_change_conservative_speed_scale: float = 0.7,
     lane_change_authorization_source: str = "route",
+    lane_change_authorization_direction: str = "",
     lane_change_defer_cost: float = 10.0,
     turn_obstacle_stop_defer_cost: float = 90.0,
+    local_obstacle_avoidance_active: bool = False,
+    local_obstacle_stop_defer_cost: float = 25.0,
     human_like_lane_change_enabled: bool = False,
     ego_speed_mps: float = 0.0,
     lane_width_m: float = 3.5,
@@ -241,13 +253,19 @@ def build_candidate_intents(
         "stop_at_intersection",
         "stop_sign",
         "emergency_brake",
+        "static_obstacle_stop",
     }
     if bool(mandatory_stop_required):
         add(CandidateBehaviorIntent(
             name="stop",
             decision=(
                 str(selected_decision)
-                if str(selected_decision) in {"stop_at_intersection", "stop_sign", "emergency_brake"}
+                if str(selected_decision) in {
+                    "stop_at_intersection",
+                    "stop_sign",
+                    "emergency_brake",
+                    "static_obstacle_stop",
+                }
                 else "stop_at_intersection"
             ),
             target_lane_id=int(current_lane_id),
@@ -287,11 +305,15 @@ def build_candidate_intents(
             base_cost=(
                 max(0.0, float(turn_obstacle_stop_defer_cost))
                 if bool(turn_in_progress)
+                else max(0.0, float(local_obstacle_stop_defer_cost))
+                if bool(local_obstacle_avoidance_active)
                 else 0.0
             ),
             reason=(
                 "front_obstacle_stop_candidate_defer_turn_in_progress"
                 if bool(turn_in_progress)
+                else "front_obstacle_stop_fallback_local_avoidance"
+                if bool(local_obstacle_avoidance_active)
                 else "front_obstacle_stop_candidate"
             ),
             stop_goal_active=True,
@@ -396,7 +418,21 @@ def build_candidate_intents(
 
     if bool(allow_lane_change_candidates) and bool(lane_change_authorized):
         target_lane_id = int(lane_change_authorized_target_lane_id or 0)
-        if target_lane_id != 0 and target_lane_id != int(current_lane_id):
+        authorized_direction = str(
+            lane_change_authorization_direction or ""
+        ).strip().lower()
+        # AD-map can prove that two distinct topology lanes are adjacent even
+        # when CARLA's lossy local canonical numbering calls both of them 1.
+        # In that case the explicit direction owns geometry selection and a
+        # same-number target must not suppress the route-required candidate.
+        topology_alias_target = bool(
+            target_lane_id == int(current_lane_id)
+            and authorized_direction in {"left", "right"}
+        )
+        if target_lane_id != 0 and (
+            target_lane_id != int(current_lane_id)
+            or bool(topology_alias_target)
+        ):
             authorization_source = str(
                 lane_change_authorization_source or "route"
             ).strip().lower()
@@ -408,6 +444,10 @@ def build_candidate_intents(
                 and str(selected_decision) in {"lane_change_left", "lane_change_right"}
                 else (
                     "lane_change_left"
+                    if authorized_direction == "left"
+                    else "lane_change_right"
+                    if authorized_direction == "right"
+                    else "lane_change_left"
                     if target_lane_id > int(current_lane_id)
                     else "lane_change_right"
                 )
@@ -417,6 +457,7 @@ def build_candidate_intents(
                 current_lane_id=int(current_lane_id),
                 lane_safety_scores=lane_safety_scores,
                 lane_prediction_risks=lane_prediction_risks,
+                is_topology_alias_target=bool(topology_alias_target),
             )
             if bool(human_like_lane_change_enabled):
                 profiles = build_human_lane_change_profiles(
@@ -440,10 +481,12 @@ def build_candidate_intents(
                     name=f"{authorization_source}_{decision}_{profile.variant}",
                     decision=str(decision),
                     target_lane_id=int(target_lane_id),
-                    target_speed_mps=max(
-                        0.8,
-                        float(target_speed_mps) * float(profile.speed_scale),
-                    ),
+                    # A lane-change candidate owns lateral geometry, duration
+                    # and ranking cost only.  Longitudinal authority belongs
+                    # to SpeedPlanner; profile.speed_scale is retained as a
+                    # geometry/ranking descriptor but must not rewrite the
+                    # commanded speed.
+                    target_speed_mps=float(target_speed_mps),
                     base_cost=float(profile.extra_cost) + float(lane_cost),
                     reason=(
                         f"{authorization_source}_lane_change_authorized"
@@ -468,7 +511,12 @@ def build_candidate_intents(
             continue
         if not bool(lane_change_authorized) or candidate_lane_id != int(lane_change_authorized_target_lane_id or 0):
             continue
-        decision = "lane_change_left" if candidate_lane_id > int(current_lane_id) else "lane_change_right"
+        authorized_direction = str(lane_change_authorization_direction or "").strip().lower()
+        decision = (
+            f"lane_change_{authorized_direction}"
+            if authorized_direction in {"left", "right"}
+            else "lane_change_left" if candidate_lane_id > int(current_lane_id) else "lane_change_right"
+        )
         # The authorized target already owns assertive/normal/conservative
         # variants above. Other lanes remain forbidden by the authorization
         # boundary and must not leak into reference generation.
@@ -546,9 +594,28 @@ def shape_lane_change_reference(
         ego_y_m=ego_y_m,
         ),
     )
-    remaining_duration = max(
-        float(dt_s),
-        float(duration) * max(0.15, 1.0 - float(initial_alpha)),
+    # `count` reference samples are all this call has to blend across --
+    # each is treated below as one more dt_s of elapsed time (t_s = index *
+    # dt_s), regardless of what duration_s/remaining_duration independently
+    # calls for. If the desired blend needs more samples than `count`
+    # provides (short lookahead, or duration_s enlarged upstream by a
+    # lane-change length floor without the reference arrays growing to
+    # match), alpha never reaches 1.0 by the last blended point -- the loop
+    # below then splices directly onto target[count:], which sits at
+    # alpha=1.0 (fully in the target lane) already. That splice is a
+    # geometric discontinuity (a lateral-offset jump) at the seam, which
+    # reads as a curvature spike independent of how long duration_s itself
+    # is. Cap the blend's time budget to what `count` can actually cover so
+    # alpha=1.0 lands on or before the last sample -- worst case the blend
+    # completes faster than the requested duration_s, which is a smooth
+    # curve throughout; it never leaves the hard seam.
+    max_available_duration_s = max(float(dt_s), float(count) * max(1.0e-3, float(dt_s)))
+    remaining_duration = min(
+        float(max_available_duration_s),
+        max(
+            float(dt_s),
+            float(duration) * max(0.15, 1.0 - float(initial_alpha)),
+        ),
     )
     result: list[Dict[str, object]] = []
     for index in range(count):
@@ -613,6 +680,7 @@ def select_comfortable_lane_change_duration_s(
     initial_progress_floor: float = 0.0,
     duration_growth_factor: float = 1.3,
     max_iterations: int = 8,
+    max_curvature_1pm: Optional[float] = None,
 ) -> tuple[float, list[Dict[str, object]], str]:
     """Widen duration_s (never shrink it) until shape_lane_change_reference's
     blended path keeps v^2*curvature within the comfort limit, or the max
@@ -623,12 +691,34 @@ def select_comfortable_lane_change_duration_s(
     acceleration than is comfortable. Widening the schedule spreads the same
     lateral crossing over more distance/time, which only ever makes the path
     gentler -- never a shorter, sharper one.
+
+    ``max_curvature_1pm``, when given, is the hard geometric curvature limit
+    the reference contract will separately enforce (raw curvature, not
+    accel). The accel-based comfort check above is v^2-weighted, so at low
+    speed a curve well past that hard limit can still read as "comfortable"
+    (small v^2 masks a large curvature) and the search would stop widening
+    before the path is actually within the contract -- exactly the case
+    that later fails as curvature_out_of_contract downstream despite this
+    function reporting success. Require both.
     """
 
     duration_s = max(float(dt_s), float(initial_duration_s))
     duration_cap_s = max(float(duration_s), float(duration_max_s))
     growth_factor = max(1.0 + 1.0e-3, float(duration_growth_factor))
     attempts = max(1, int(max_iterations))
+    aligned_target = _align_target_reference_to_source(
+        source_reference=source_reference,
+        target_reference=target_reference,
+    )
+    # The road's own curvature is handled by the longitudinal curvature
+    # speed envelope.  Only curvature added by the lateral blend belongs in
+    # the lane-change duration comfort check; otherwise a curved target road
+    # can never be "fixed" by widening the maneuver and every change is
+    # incorrectly stretched to duration_max_s.
+    baseline_curvature_1pm = max(
+        max(0.0, float(curvature_fn(source_reference))),
+        max(0.0, float(curvature_fn(aligned_target))),
+    )
     shaped: list[Dict[str, object]] = []
     for attempt in range(attempts):
         shaped = shape_lane_change_reference(
@@ -645,8 +735,21 @@ def select_comfortable_lane_change_duration_s(
             blend_geometry=True,
         )
         curvature_1pm = max(0.0, float(curvature_fn(shaped)))
-        implied_lateral_accel_mps2 = float(target_speed_mps) ** 2 * curvature_1pm
-        if float(implied_lateral_accel_mps2) <= float(lateral_accel_limit_mps2):
+        added_curvature_1pm = max(
+            0.0,
+            float(curvature_1pm) - float(baseline_curvature_1pm),
+        )
+        implied_lateral_accel_mps2 = (
+            float(target_speed_mps) ** 2 * float(added_curvature_1pm)
+        )
+        within_hard_curvature_limit = (
+            max_curvature_1pm is None
+            or float(curvature_1pm) <= float(max_curvature_1pm)
+        )
+        if (
+            float(implied_lateral_accel_mps2) <= float(lateral_accel_limit_mps2)
+            and bool(within_hard_curvature_limit)
+        ):
             return float(duration_s), shaped, "lane_change_duration_within_comfort_limit"
         # Return using *this* attempt's own (duration_s, shaped) pair, not a
         # duration_s that was grown for a next attempt that never runs --
@@ -655,6 +758,84 @@ def select_comfortable_lane_change_duration_s(
             return float(duration_s), shaped, "lane_change_duration_capped_at_max"
         duration_s = min(float(duration_cap_s), float(duration_s) * float(growth_factor))
     return float(duration_s), shaped, "lane_change_duration_capped_at_max"
+
+
+def predicted_lane_change_average_speed_mps(
+    *,
+    ego_speed_mps: float,
+    target_speed_mps: float,
+    duration_s: float,
+    acceleration_limit_mps2: float = 2.0,
+) -> float:
+    """Average reachable speed used to convert maneuver time to distance."""
+
+    ego_speed = max(0.0, float(ego_speed_mps))
+    target_speed = max(0.0, float(target_speed_mps))
+    duration = max(0.0, float(duration_s))
+    acceleration = max(0.0, float(acceleration_limit_mps2))
+    reachable_end_speed = min(
+        float(target_speed),
+        float(ego_speed) + float(acceleration) * float(duration),
+    )
+    return max(
+        0.5,
+        0.5 * (float(ego_speed) + float(reachable_end_speed)),
+    )
+
+
+def lane_change_geometry_requirements(
+    *,
+    ego_speed_mps: float,
+    target_speed_mps: float,
+    duration_s: float,
+    dt_s: float,
+    lane_width_m: float,
+    max_curvature_1pm: float,
+    minimum_geometry_speed_mps: float = 2.0,
+    minimum_length_m: float = 10.0,
+    acceleration_limit_mps2: float = 2.0,
+    quintic_curvature_shape_constant: float = 5.7735,
+) -> tuple[float, float, float]:
+    """Return geometry speed, longitudinal length and spatial sample step.
+
+    The lateral quintic is a spatial path.  Near zero ego speed, using
+    ``ego_speed * duration`` collapses its longitudinal span and makes
+    curvature grow approximately with ``lane_width / length**2``.  Use a
+    minimum geometry speed and an explicit curvature-derived length floor;
+    longitudinal speed planning remains free to start from zero.
+    """
+
+    duration = max(float(dt_s), float(duration_s))
+    dt = max(1.0e-3, float(dt_s))
+    predicted_average_speed = predicted_lane_change_average_speed_mps(
+        ego_speed_mps=float(ego_speed_mps),
+        target_speed_mps=float(target_speed_mps),
+        duration_s=float(duration),
+        acceleration_limit_mps2=float(acceleration_limit_mps2),
+    )
+    geometry_speed = max(
+        float(predicted_average_speed),
+        max(0.1, float(minimum_geometry_speed_mps)),
+    )
+    curvature_limit = max(1.0e-3, float(max_curvature_1pm))
+    lateral_shift = max(0.1, abs(float(lane_width_m)))
+    curvature_length = math.sqrt(
+        max(0.1, float(quintic_curvature_shape_constant))
+        * float(lateral_shift)
+        / float(curvature_limit)
+    )
+    longitudinal_length = max(
+        max(0.1, float(minimum_length_m)),
+        float(curvature_length),
+        float(geometry_speed) * float(duration),
+    )
+    transition_steps = max(1, int(math.ceil(float(duration) / float(dt))))
+    step_distance = float(longitudinal_length) / float(transition_steps)
+    return (
+        float(geometry_speed),
+        float(longitudinal_length),
+        float(step_distance),
+    )
 
 
 def _align_target_reference_to_source(
@@ -739,6 +920,153 @@ def _sample_separation_sq(
         return float((target_x - source_x) ** 2 + (target_y - source_y) ** 2)
     except Exception:
         return 0.0
+
+
+def _waypoint_xy(waypoint: object) -> tuple[float, float] | None:
+    """Read the same waypoint position from either planner map boundary."""
+    position = getattr(waypoint, "position", None)
+    if isinstance(position, Mapping):
+        return float(position.get("x", 0.0)), float(position.get("y", 0.0))
+    location = getattr(getattr(waypoint, "transform", None), "location", None)
+    if location is None:
+        return None
+    return float(location.x), float(location.y)
+
+
+def route_lane_change_target_anchor(
+    *,
+    map_planner: object,
+    route_points: Sequence[Sequence[float]],
+    ego_x_m: float,
+    ego_y_m: float,
+    z_m: float = 0.0,
+    nominal_step_m: float = 1.0,
+) -> tuple[object | None, str]:
+    """Find the continuous target-lane anchor after a route lateral edge.
+
+    CARLA GRP encodes a lane change as one long lateral segment between two
+    otherwise approximately unit-spaced lane-center polylines.  The point
+    after that segment identifies the physical target lane even when both
+    lanes share the same canonical lane id.  Walking that waypoint backward
+    to the ego station gives a continuous target centerline for trajectory
+    generation, without feeding the lateral jump itself to MPC.
+    """
+
+    points = [list(point) for point in list(route_points or []) if len(point) >= 2]
+    if len(points) < 3 or map_planner is None:
+        return None, "target_anchor_missing_route"
+    nearest_index = min(
+        range(len(points)),
+        key=lambda index: (
+            (float(points[index][0]) - float(ego_x_m)) ** 2
+            + (float(points[index][1]) - float(ego_y_m)) ** 2
+        ),
+    )
+    normal_steps = []
+    for first, second in zip(points[:-1], points[1:]):
+        distance_m = math.hypot(
+            float(second[0]) - float(first[0]),
+            float(second[1]) - float(first[1]),
+        )
+        if distance_m > 1.0e-3:
+            normal_steps.append(float(distance_m))
+    if not normal_steps:
+        return None, "target_anchor_zero_length_route"
+    sorted_steps = sorted(normal_steps)
+    median_step_m = float(sorted_steps[len(sorted_steps) // 2])
+    jump_threshold_m = max(
+        2.0 * max(0.25, float(nominal_step_m)),
+        1.5 * float(median_step_m),
+    )
+    target_index = None
+    for index in range(max(0, nearest_index), len(points) - 1):
+        distance_m = math.hypot(
+            float(points[index + 1][0]) - float(points[index][0]),
+            float(points[index + 1][1]) - float(points[index][1]),
+        )
+        if float(distance_m) >= float(jump_threshold_m):
+            target_index = int(index) + 1
+            break
+    if target_index is None:
+        return None, "target_anchor_no_lateral_route_edge"
+
+    target_point = points[target_index]
+    target_waypoint = map_planner.get_waypoint({
+        "x": float(target_point[0]),
+        "y": float(target_point[1]),
+        "z": float(target_point[2]) if len(target_point) >= 3 else float(z_m),
+    })
+    if target_waypoint is None:
+        return None, "target_anchor_projection_failed"
+
+    target_xy = _waypoint_xy(target_waypoint)
+    if target_xy is None:
+        return None, "target_anchor_projection_failed"
+    best_waypoint = target_waypoint
+    best_distance_m = math.hypot(float(target_xy[0]) - float(ego_x_m), float(target_xy[1]) - float(ego_y_m))
+    current = target_waypoint
+    step_m = max(0.5, float(nominal_step_m))
+    for _ in range(120):
+        previous = list(current.previous(float(step_m)) or [])
+        if not previous:
+            break
+        previous_with_xy = [(waypoint, _waypoint_xy(waypoint)) for waypoint in previous]
+        previous_with_xy = [(waypoint, xy) for waypoint, xy in previous_with_xy if xy is not None]
+        if not previous_with_xy:
+            break
+        candidate, candidate_xy = min(
+            previous_with_xy,
+            key=lambda item: math.hypot(float(item[1][0]) - float(ego_x_m), float(item[1][1]) - float(ego_y_m)),
+        )
+        candidate_distance_m = math.hypot(float(candidate_xy[0]) - float(ego_x_m), float(candidate_xy[1]) - float(ego_y_m))
+        if float(candidate_distance_m) + 1.0e-3 < float(best_distance_m):
+            best_waypoint = candidate
+            best_distance_m = float(candidate_distance_m)
+            current = candidate
+            continue
+        break
+    return best_waypoint, "target_anchor_from_post_change_lane"
+
+
+def physical_adjacent_direction(
+    *,
+    ego_waypoint: object,
+    target_waypoint: object,
+) -> tuple[str, str]:
+    """Resolve route target side in CARLA's physical waypoint topology."""
+
+    if ego_waypoint is None or target_waypoint is None:
+        return "", "physical_direction_missing_waypoint"
+    target_xy = _waypoint_xy(target_waypoint)
+    if target_xy is None:
+        return "", "physical_direction_missing_target_location"
+
+    matches: list[tuple[float, str]] = []
+    for direction, accessor_name in (
+        ("left", "left"),
+        ("right", "right"),
+    ):
+        accessor = getattr(ego_waypoint, accessor_name, None) or getattr(ego_waypoint, "get_{}_lane".format(direction), None)
+        try:
+            adjacent = accessor() if callable(accessor) else None
+        except Exception:
+            adjacent = None
+        adjacent_xy = _waypoint_xy(adjacent)
+        if adjacent_xy is None:
+            continue
+        distance_m = math.hypot(float(adjacent_xy[0]) - float(target_xy[0]), float(adjacent_xy[1]) - float(target_xy[1]))
+        matches.append((float(distance_m), str(direction)))
+    if not matches:
+        return "", "physical_direction_no_adjacent_lane"
+    matches.sort(key=lambda item: item[0])
+    best_distance_m, best_direction = matches[0]
+    lane_width_m = max(
+        2.0,
+        float(getattr(ego_waypoint, "lane_width_m", getattr(ego_waypoint, "lane_width", 3.5)) or 3.5),
+    )
+    if float(best_distance_m) > float(lane_width_m):
+        return "", "physical_direction_target_not_adjacent"
+    return str(best_direction), "physical_direction_from_carla_adjacency"
 
 
 def _lane_change_initial_progress(
@@ -836,6 +1164,81 @@ def build_route_tracking_lane_change_envelope_blocks(
                 heading_rad=float(heading_rad),
                 half_length_m=float(half_length_m),
                 half_width_m=float(half_width_m),
+            )
+        )
+    return blocks
+
+
+def build_turn_reference_envelope_blocks(
+    *,
+    reference_samples: Sequence[Mapping[str, object]],
+    ego_half_width_m: float,
+    safety_margin_m: float = 0.15,
+    default_lane_width_m: float = 3.5,
+    longitudinal_overlap_m: float = 0.75,
+    min_half_width_m: float = 0.15,
+) -> list[RoadEnvelopeBlock]:
+    """Build a rolling center-feasibility tube around a turn reference.
+
+    The blocks describe only the current MPC horizon.  Unlike the old locked
+    turn envelope, they are rebuilt from the current rolling reference so the
+    constraint cannot become stale while the ego progresses through a
+    junction.  Each block is shrunk by the ego half-width and safety margin;
+    the full swept-body contract remains the reference admission check.
+    """
+
+    normalized = [
+        normalize_lane_reference_sample(
+            sample,
+            default_lane_width_m=float(default_lane_width_m),
+        )
+        for sample in list(reference_samples or [])
+    ]
+    normalized = [sample for sample in normalized if sample is not None]
+    if len(normalized) < 2:
+        return []
+    clearance_m = max(0.0, float(ego_half_width_m)) + max(
+        0.0, float(safety_margin_m)
+    )
+    overlap_m = max(0.0, float(longitudinal_overlap_m))
+    blocks: list[RoadEnvelopeBlock] = []
+    for first, second in zip(normalized[:-1], normalized[1:]):
+        dx_m = float(second.x_center_m) - float(first.x_center_m)
+        dy_m = float(second.y_center_m) - float(first.y_center_m)
+        segment_length_m = math.hypot(float(dx_m), float(dy_m))
+        if float(segment_length_m) <= 1.0e-4:
+            continue
+        heading_rad = math.atan2(float(dy_m), float(dx_m))
+        road_center_offset_m = 0.5 * (
+            float(first.road_center_offset_m)
+            + float(second.road_center_offset_m)
+        )
+        normal_x = -math.sin(float(heading_rad))
+        normal_y = math.cos(float(heading_rad))
+        center_x_m = 0.5 * (
+            float(first.x_center_m) + float(second.x_center_m)
+        ) + float(road_center_offset_m) * float(normal_x)
+        center_y_m = 0.5 * (
+            float(first.y_center_m) + float(second.y_center_m)
+        ) + float(road_center_offset_m) * float(normal_y)
+        road_half_width_m = 0.25 * (
+            float(first.road_left_width_m)
+            + float(first.road_right_width_m)
+            + float(second.road_left_width_m)
+            + float(second.road_right_width_m)
+        )
+        blocks.append(
+            RoadEnvelopeBlock(
+                x_center_m=float(center_x_m),
+                y_center_m=float(center_y_m),
+                heading_rad=float(heading_rad),
+                half_length_m=(
+                    0.5 * float(segment_length_m) + float(overlap_m)
+                ),
+                half_width_m=max(
+                    float(min_half_width_m),
+                    float(road_half_width_m) - float(clearance_m),
+                ),
             )
         )
     return blocks
@@ -1145,11 +1548,29 @@ def _lane_cost(
     current_lane_id: int,
     lane_safety_scores: Mapping[int, float],
     lane_prediction_risks: Mapping[int, Mapping[str, object]],
+    is_topology_alias_target: bool = False,
 ) -> float:
-    safety = max(0.0, min(1.0, float(lane_safety_scores.get(int(lane_id), 0.0))))
-    risk = dict(lane_prediction_risks.get(int(lane_id), {}) or {})
-    risk_cost = 80.0 if bool(risk.get("risk", False)) else 0.0
-    lane_change_cost = 5.0 if int(lane_id) != int(current_lane_id) else 0.0
+    # lane_safety_scores/lane_prediction_risks are keyed by this tick's
+    # canonical recount at ego's own cross-section (see
+    # planner_input_adapter.py's available_lane_ids), which only assigns
+    # unique numbers to lanes visible from there. A topology-alias target
+    # (see the topology_alias_target comment above) is a physically
+    # different, farther lane that the recount coincidentally numbers the
+    # same as current_lane_id -- looking it up under that shared key would
+    # silently read ego's own lane's score, not the target's, and would
+    # zero out lane_change_cost for what is, physically, a real lane
+    # change. Neither dict has real data for that lane at all, so fall
+    # back to the same conservative "no data" default already used for a
+    # genuinely missing key, and still charge the lane-change cost.
+    if bool(is_topology_alias_target):
+        safety = 0.0
+        risk_cost = 0.0
+        lane_change_cost = 5.0
+    else:
+        safety = max(0.0, min(1.0, float(lane_safety_scores.get(int(lane_id), 0.0))))
+        risk = dict(lane_prediction_risks.get(int(lane_id), {}) or {})
+        risk_cost = 80.0 if bool(risk.get("risk", False)) else 0.0
+        lane_change_cost = 5.0 if int(lane_id) != int(current_lane_id) else 0.0
     return float(10.0 * (1.0 - safety) + risk_cost + lane_change_cost)
 
 

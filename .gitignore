@@ -56,3 +56,7 @@ env/
 /PLANNER_NODE_SEPARATION_PLAN.md
 
 /src/cpx_planning/test/
+
+# Local timing reports generated when debug_time is enabled
+/ros_planner_timing_summary.json
+/ros_timing_summary.json

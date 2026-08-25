@@ -4,6 +4,7 @@ import json
 import queue
 import socket
 import threading
+import time
 
 
 TCP_HOST = "127.0.0.1"
@@ -12,9 +13,10 @@ TCP_HOST = "127.0.0.1"
 class TcpJsonReceiver:
     """Receive JSON on one TCP port and store it until a ROS node reads it."""
 
-    def __init__(self, tcp_port, logger):
+    def __init__(self, tcp_port, logger, on_message=None):
         self.tcp_port = tcp_port
         self.logger = logger
+        self.on_message = on_message
         self.messages = queue.Queue()
         self.stop_event = threading.Event()
         self.server_socket = None
@@ -80,7 +82,10 @@ class TcpJsonReceiver:
 
                         try:
                             message = json.loads(raw_message.decode("utf-8"))
+                            message["_timing"] = {"tcp_received_wall_time_ns": time.time_ns(), "tcp_received_perf_counter_ns": time.perf_counter_ns()}
                             self.messages.put(message)
+                            if self.on_message is not None:
+                                self.on_message()
                         except (ValueError, UnicodeDecodeError) as error:
                             self.logger.warning(
                                 "Invalid JSON received: {}".format(error)

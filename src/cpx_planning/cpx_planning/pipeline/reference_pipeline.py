@@ -155,6 +155,23 @@ class ReferencePipeline:
                     reference=reference,
                     current_state=request.current_state,
                 )
+        if mode == "lane_change" and reference:
+            # Cleaning and curvature conditioning operate on the reference
+            # independently of the short-horizon destination supplied by the
+            # candidate.  Always bind the MPC destination back to the final
+            # lane-change geometry, even when no curvature correction was
+            # necessary.  Otherwise a perfectly valid locked trajectory can
+            # be rejected because its stale pre-conditioning destination is
+            # compared with the new reference.
+            aligned_destination = self._aligned_destination(
+                mode=mode,
+                destination=destination,
+                reference=reference,
+                current_state=request.current_state,
+            )
+            if list(aligned_destination[:2]) != list(destination[:2]):
+                reasons.append("lane_change_destination_aligned_to_reference")
+            destination = list(aligned_destination)
         turn_footprint_validation = None
         boundary_recovery_validation = None
         if mode == "intersection_turn" and bool(boundary_recovery):

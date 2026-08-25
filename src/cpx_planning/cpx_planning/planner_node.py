@@ -17,7 +17,6 @@ from cpx_interfaces.msg import CooperativeMessageArray, PlannerInputFrame, Traff
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 import rclpy
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -27,6 +26,11 @@ from cpx_planning.component_interfaces import DistributedInputAdapter, PlannerLo
 from cpx_planning.planner_core.cpx_mpc_planner import CPXMPCPlannerBridge
 from cpx_planning.ros_input_adapter import ROSInputAdapter
 from cpx_planning.ros_output_adapter import ROSOutputAdapter
+from cpx_planning.timing import CycleTimingRecorder, default_timing_summary_path
+
+
+# Enable detailed timing without enabling the much larger planner debug logs.
+debug_time = False
 
 
 def _default_planner_input_log_path():
@@ -79,6 +83,20 @@ def _time_message(timestamp_s):
     return message
 
 
+def _input_message_timestamp_s(input_name, message):
+    """Read the simulation timestamp used to match one raw callback to a planning cycle."""
+    if str(input_name) == "safety_status":
+        try:
+            return float(json.loads(str(message.data or "{}")).get("timestamp_s", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    header = getattr(message, "header", None)
+    stamp = getattr(header, "stamp", None)
+    if stamp is None:
+        return 0.0
+    return float(stamp.sec) + float(stamp.nanosec) / 1000000000.0
+
+
 class CPXPlannerNode(Node):
     """Receive raw ROS data and run the same CP-X bridge used by OpenCDA."""
 
@@ -90,8 +108,13 @@ class CPXPlannerNode(Node):
         self.declare_parameter("planner_input_log_path", str(_default_planner_input_log_path()))
         self.declare_parameter("control_topic", "/control/command/control_cmd")
         self.declare_parameter("debug", False)
-        self.declare_parameter("planning_period_s", 0.05)
+        self.declare_parameter("debug_time", debug_time)
+        self.declare_parameter("timing_summary_path", str(default_timing_summary_path()))
         self.debug = bool(self.get_parameter("debug").value)
+        self.debug_time = bool(self.get_parameter("debug_time").value)
+        self.timing_recorder = CycleTimingRecorder(enabled=self.debug_time, summary_path=str(self.get_parameter("timing_summary_path").value))
+        if local_bus is not None:
+            local_bus.timing_recorder = self.timing_recorder
         planner_config = load_planner_configuration(package_root)
         planner_config["debug"] = bool(self.debug)
         planner_config["record_debug"] = bool(self.debug)
@@ -116,7 +139,6 @@ class CPXPlannerNode(Node):
         self._last_frame_timestamp_s = None
         self._waiting_message_printed = False
         self._planning_lock = threading.RLock()
-        self._planning_callback_group = MutuallyExclusiveCallbackGroup()
 
         self.ros_output_adapter = ROSOutputAdapter()
         self.control_publisher = self.create_publisher(Control, str(self.get_parameter("control_topic").value), 10)
@@ -132,17 +154,34 @@ class CPXPlannerNode(Node):
         self.cooperative_subscription = self.create_subscription(CooperativeMessageArray, "/cpx/cooperative_messages", lambda message: self._receive("cooperative", message), 10)
         self.safety_status_subscription = self.create_subscription(String, "/cpx/safety_status", lambda message: self._receive("safety_status", message), 10)
         self.destination_subscription = self.create_subscription(PoseStamped, "/cpx/final_destination", lambda message: self._receive("final_destination", message), 10)
+        self.timing_subscription = self.create_subscription(String, "/cpx/timing/events", self._receive_timing_event, 100) if self.debug_time else None
 
         self.planner_input_log_path = Path(str(self.get_parameter("planner_input_log_path").value)).expanduser().resolve()
         if self.debug:
             self.planner_input_log_path.parent.mkdir(parents=True, exist_ok=True)
             self.planner_input_log_path.write_text("", encoding="utf-8")
-        self.create_timer(float(self.get_parameter("planning_period_s").value), self.run_planning_cycle, callback_group=self._planning_callback_group)
-        self.get_logger().info("CP-X planner coordinator is waiting for ROS inputs at 20 Hz.")
+        self.get_logger().info("CP-X planner coordinator is event-driven by synchronized OpenCDA inputs (source rate: 20 Hz).")
 
     def _receive(self, input_name, message):
         """Forward each raw ROS message to the matching input-adapter method."""
-        self._apply_message(input_name, message)
+        callback_started_wall_time_ns = time.time_ns()
+        callback_wait_started = time.perf_counter()
+        callback_cycle_id = cycle_id_from_timestamp(_input_message_timestamp_s(input_name, message))
+        self.timing_recorder.record_event_time(callback_cycle_id, "input.{}.callback_started".format(input_name), callback_started_wall_time_ns)
+        with self._planning_lock:
+            self.timing_recorder.record_duration(callback_cycle_id, "callback_message_waiting.{}.planning_lock".format(input_name), (time.perf_counter() - callback_wait_started) * 1000.0)
+            self._apply_message(input_name, message)
+            if self.input_adapter.ready():
+                self.run_planning_cycle()
+
+    def _receive_timing_event(self, message):
+        """Store transport timing published by the TCP/ROS boundary nodes."""
+        try:
+            event = json.loads(str(message.data or "{}"))
+        except (TypeError, ValueError):
+            return
+        if isinstance(event, dict):
+            self.timing_recorder.record_external_event(event)
 
     def _apply_message(self, input_name, message):
         """Call the matching ROS adapter update method without changing the data."""
@@ -171,20 +210,38 @@ class CPXPlannerNode(Node):
                 return
             planning_started_monotonic = time.perf_counter()
             cycle_id = cycle_id_from_timestamp(timestamp_s)
+            self.timing_recorder.start_cycle(cycle_id, timestamp_s)
+            self.timing_recorder.record_event_time(cycle_id, "planner.cycle_started", time.time_ns())
+            source_send_wall_time_ns = int((self.input_adapter._safety_status or {}).get("cycle_send_started_wall_time_ns", 0) or 0)
+            if source_send_wall_time_ns > 0:
+                self.timing_recorder.record_duration(cycle_id, "transport.opencda_send_to_ros_inputs_ready", (time.time_ns() - source_send_wall_time_ns) / 1000000.0)
             self._set_component_cycle(cycle_id, timestamp_s)
             try:
+                stage_started = time.perf_counter()
                 runtime_inputs = self.input_adapter.runtime_inputs()
+                self.timing_recorder.record_duration(cycle_id, "input.runtime_inputs", (time.perf_counter() - stage_started) * 1000.0)
                 ego_pose = dict(runtime_inputs["ego_pose"])
                 ego_location = PlannerLocation(x=float(ego_pose["x"]), y=float(ego_pose["y"]), z=float(ego_pose.get("z", 0.0)))
                 cp_payload = dict(runtime_inputs["cp_payload"] or {})
+                stage_started = time.perf_counter()
                 object_snapshots = self.planner_bridge._fused_planning_object_snapshots(local_object_snapshots=runtime_inputs["local_object_snapshots"], cp_obstacles=list(cp_payload.get("obstacles", []) or []), ego_location=ego_location, sim_time_s=timestamp_s)
+                self.timing_recorder.record_duration(cycle_id, "input.object_fusion", (time.perf_counter() - stage_started) * 1000.0)
+                stage_started = time.perf_counter()
                 adapter_output = self.input_adapter.build(ego_location=ego_location, ego_yaw_rad=float(ego_pose["heading_rad"]), ego_speed_mps=float(runtime_inputs["ego_speed_mps"]), object_snapshots=object_snapshots, cp_payload=cp_payload)
+                self.timing_recorder.record_duration(cycle_id, "input.build_adapter_output", (time.perf_counter() - stage_started) * 1000.0)
+                stage_started = time.perf_counter()
                 self._publish_input_frame(cycle_id, timestamp_s, adapter_output, runtime_inputs)
+                self.timing_recorder.record_duration(cycle_id, "input.publish_frame", (time.perf_counter() - stage_started) * 1000.0)
                 self.planner_bridge._prediction_lane_step_resolved_count = int(getattr(self.planner_bridge, "_prediction_lane_step_resolved_count", 0))
                 self.planner_bridge._prediction_lane_step_none_count = int(getattr(self.planner_bridge, "_prediction_lane_step_none_count", 0))
                 self.planner_bridge.input_adapter = DistributedInputAdapter(adapter_output, runtime_inputs)
+                stage_started = time.perf_counter()
                 planner_output = self.planner_bridge.run_step()
+                self.timing_recorder.record_duration(cycle_id, "planner.full_pipeline", (time.perf_counter() - stage_started) * 1000.0)
             except Exception as exc:
+                self.timing_recorder.record_value(cycle_id, "failure_reason", str(exc))
+                self.timing_recorder.record_duration(cycle_id, "planner.cycle_to_failure", (time.perf_counter() - planning_started_monotonic) * 1000.0)
+                self.timing_recorder.finish_cycle(cycle_id, {"success": False})
                 self.get_logger().error("Could not run the copied CP-X planning cycle: {}".format(exc))
                 return
             self._last_frame_timestamp_s = timestamp_s
@@ -194,13 +251,31 @@ class CPXPlannerNode(Node):
             if self.debug:
                 self.write_planner_input_adapter_output(adapter_output)
                 self.publish_debug_output(adapter_output, planner_output)
+            stage_started = time.perf_counter()
             control_message = self.ros_output_adapter.build_control_message(planner_output=planner_output, stamp=_time_message(timestamp_s))
+            self.timing_recorder.record_duration(cycle_id, "output.build_autoware_control", (time.perf_counter() - stage_started) * 1000.0)
             planning_cycle_time_ms = (time.perf_counter() - planning_started_monotonic) * 1000.0
             self.latest_planning_cycle_time_ms = float(planning_cycle_time_ms)
+            output_created_wall_time_ns = time.time_ns()
+            source_to_output_created_ms = (output_created_wall_time_ns - source_send_wall_time_ns) / 1000000.0 if source_send_wall_time_ns > 0 else None
+            output_publish_started_wall_time_ns = time.time_ns()
+            self.timing_recorder.record_event_time(cycle_id, "output.control_topics_publish_started", output_publish_started_wall_time_ns)
             tcp_control_output = String()
-            tcp_control_output.data = json.dumps({"cycle_time_s": float(timestamp_s), "target_speed_mps": float(control_message.longitudinal.velocity), "acceleration_mps2": float(control_message.longitudinal.acceleration), "steering_rad": float(control_message.lateral.steering_tire_angle), "planning_cycle_time_ms": float(planning_cycle_time_ms)}, allow_nan=False, separators=(",", ":"))
+            tcp_control_output.data = json.dumps({"cycle_time_s": float(timestamp_s), "target_speed_mps": float(control_message.longitudinal.velocity), "acceleration_mps2": float(control_message.longitudinal.acceleration), "steering_rad": float(control_message.lateral.steering_tire_angle), "planning_cycle_time_ms": float(planning_cycle_time_ms), "source_send_wall_time_ns": int(source_send_wall_time_ns), "ros_output_created_wall_time_ns": int(output_created_wall_time_ns), "ros_output_publish_started_wall_time_ns": int(output_publish_started_wall_time_ns), "source_to_output_created_ms": source_to_output_created_ms}, allow_nan=False, separators=(",", ":"))
+            stage_started = time.perf_counter()
             self.tcp_control_output_publisher.publish(tcp_control_output)
+            self.timing_recorder.record_duration(cycle_id, "output_publishing.ros_compact_control_topic", (time.perf_counter() - stage_started) * 1000.0)
+            stage_started = time.perf_counter()
             self.control_publisher.publish(control_message)
+            self.timing_recorder.record_duration(cycle_id, "output_publishing.autoware_control_topic", (time.perf_counter() - stage_started) * 1000.0)
+            output_publish_finished_wall_time_ns = time.time_ns()
+            self.timing_recorder.record_event_time(cycle_id, "output.control_topics_publish_finished", output_publish_finished_wall_time_ns)
+            self.timing_recorder.record_duration(cycle_id, "output.publish", (output_publish_finished_wall_time_ns - output_publish_started_wall_time_ns) / 1000000.0)
+            self.timing_recorder.record_duration(cycle_id, "output_publishing.ros_control_topics_total", (output_publish_finished_wall_time_ns - output_publish_started_wall_time_ns) / 1000000.0)
+            self.timing_recorder.record_duration(cycle_id, "planner.planning_cycle_time", planning_cycle_time_ms)
+            if source_to_output_created_ms is not None:
+                self.timing_recorder.record_duration(cycle_id, "transport.opencda_send_to_ros_output_created", source_to_output_created_ms)
+            self.timing_recorder.finish_cycle(cycle_id, {"success": True})
             self.latest_control_message = control_message
             if self.debug:
                 self._log_cycle(adapter_output, planner_output)
@@ -289,6 +364,7 @@ class CPXPlannerNode(Node):
         if self.planner_bridge is not None:
             self.planner_bridge.destroy()
         self.global_planner.close()
+        self.timing_recorder.write_summary()
         super().destroy_node()
 
 

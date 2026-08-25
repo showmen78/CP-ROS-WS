@@ -61,6 +61,52 @@ def normalize_route_maneuver(value: object) -> RouteManeuver:
     return RouteManeuver.UNKNOWN
 
 
+def suppress_lane_change_for_lateral_owner(
+    authorization: LaneChangeAuthorization,
+    *,
+    owner_state: object,
+) -> LaneChangeAuthorization:
+    """Give an active turn/recovery state exclusive lateral authority."""
+
+    state = str(owner_state or "").strip().upper()
+    exclusive_states = {
+        "PREPARE_TURN",
+        "INTERSECTION_TURN",
+        "TURN_EXIT_STABILIZATION",
+        "CREEP",
+        "BOUNDARY_RECOVERY",
+    }
+    if not bool(authorization.allowed) or state not in exclusive_states:
+        return authorization
+    return LaneChangeAuthorization(
+        allowed=False,
+        direction=authorization.direction,
+        reason=f"scenario_lateral_owner:{state.lower()}",
+        required_by_route=bool(authorization.required_by_route),
+        distance_to_maneuver_m=authorization.distance_to_maneuver_m,
+        target_lane_id=int(authorization.target_lane_id),
+        maneuver=str(authorization.maneuver),
+    )
+
+
+def lane_change_target_reached(
+    *,
+    current_lane_id: int,
+    remembered_target_lane_id: int,
+    current_ad_lane_id: int = 0,
+    remembered_target_ad_lane_id: int = 0,
+    target_in_local_frame: bool = False,
+    target_lane_offset: int = 0,
+) -> bool:
+    """Resolve completion by corridor relation, then stable identity."""
+
+    if bool(target_in_local_frame) and int(target_lane_offset) == 0:
+        return True
+    if int(current_ad_lane_id or 0) != 0 and int(remembered_target_ad_lane_id or 0) != 0:
+        return int(current_ad_lane_id) == int(remembered_target_ad_lane_id)
+    return int(current_lane_id or 0) == int(remembered_target_lane_id or 0)
+
+
 def authorize_route_lane_change(
     *,
     route_lane_change_allowed: bool,
@@ -76,6 +122,12 @@ def authorize_route_lane_change(
     latest_start_distance_m: float,
     target_safety_threshold: float,
     require_adjacent: bool = True,
+    explicit_lane_change_start_distance_m: Optional[float] = None,
+    adjacent_lane_directions: Optional[Mapping[int, str]] = None,
+    topology_current_lane_id: int = 0,
+    topology_target_lane_id: int = 0,
+    topology_lane_offset: int = 0,
+    topology_target_in_local_frame: bool = True,
 ) -> LaneChangeAuthorization:
     if not bool(route_lane_change_allowed):
         return _denied("route_lane_change_not_allowed", next_macro_maneuver, remaining_distance_m, current_lane_id)
@@ -96,7 +148,25 @@ def authorize_route_lane_change(
         return _denied("already_in_turn_connector", maneuver, remaining_distance_m, current_lane_id)
     if target_lane_id == 0:
         return _denied("missing_required_lane_id", maneuver, remaining_distance_m, current_lane_id)
-    if target_lane_id == current_lane_id:
+    topology_requires_change = bool(
+        int(topology_current_lane_id or 0) != 0
+        and int(topology_target_lane_id or 0) != 0
+        and int(topology_current_lane_id) != int(topology_target_lane_id)
+        and int(topology_lane_offset or 0) != 0
+    )
+    if (
+        int(topology_current_lane_id or 0) != 0
+        and int(topology_target_lane_id or 0) != 0
+        and int(topology_current_lane_id) != int(topology_target_lane_id)
+        and not bool(topology_target_in_local_frame)
+    ):
+        return _denied(
+            "route_target_outside_local_frame",
+            maneuver,
+            remaining_distance_m,
+            target_lane_id,
+        )
+    if target_lane_id == current_lane_id and not bool(topology_requires_change):
         return LaneChangeAuthorization(
             allowed=False,
             direction=None,
@@ -117,11 +187,25 @@ def authorize_route_lane_change(
             available.add(normalized_lane_id)
     if target_lane_id not in available:
         return _denied("required_lane_not_available", maneuver, remaining_distance_m, target_lane_id)
-    lane_delta = int(target_lane_id) - int(current_lane_id)
-    if bool(require_adjacent) and abs(int(lane_delta)) != 1:
+    topology_directions = {
+        int(lane_id): str(direction).strip().lower()
+        for lane_id, direction in dict(adjacent_lane_directions or {}).items()
+        if str(direction).strip().lower() in {"left", "right"}
+    }
+    topology_offset_direction = (
+        "left" if int(topology_lane_offset or 0) > 0
+        else "right" if int(topology_lane_offset or 0) < 0
+        else None
+    )
+    if bool(topology_requires_change) and topology_offset_direction:
+        expected_direction = str(topology_offset_direction)
+    elif topology_directions:
+        expected_direction = topology_directions.get(int(target_lane_id))
+    else:
+        lane_delta = int(target_lane_id) - int(current_lane_id)
+        expected_direction = _direction_for_delta(lane_delta)
+    if bool(require_adjacent) and expected_direction not in {"left", "right"}:
         return _denied("required_lane_not_adjacent", maneuver, remaining_distance_m, target_lane_id)
-
-    expected_direction = _direction_for_delta(lane_delta)
     if maneuver == RouteManeuver.TURN_LEFT and expected_direction != "left":
         return _denied("required_lane_direction_mismatch_left_turn", maneuver, remaining_distance_m, target_lane_id)
     if maneuver == RouteManeuver.TURN_RIGHT and expected_direction != "right":
@@ -136,6 +220,18 @@ def authorize_route_lane_change(
         RouteManeuver.LANE_CHANGE_LEFT,
         RouteManeuver.LANE_CHANGE_RIGHT,
     }
+    if (
+        explicit_lane_change
+        and distance is not None
+        and explicit_lane_change_start_distance_m is not None
+        and float(distance) > float(explicit_lane_change_start_distance_m)
+    ):
+        return _denied(
+            "explicit_lane_change_trigger_too_far",
+            maneuver,
+            distance,
+            target_lane_id,
+        )
     if distance is not None and not explicit_lane_change:
         if float(distance) > float(preparation_start_distance_m):
             return _denied("maneuver_too_far_for_lane_change", maneuver, distance, target_lane_id)
@@ -152,7 +248,11 @@ def authorize_route_lane_change(
     return LaneChangeAuthorization(
         allowed=True,
         direction=str(expected_direction),
-        reason="route_lane_change_authorized",
+        reason=(
+            "route_lane_change_authorized_by_topology"
+            if bool(topology_requires_change)
+            else "route_lane_change_authorized"
+        ),
         required_by_route=True,
         distance_to_maneuver_m=distance,
         target_lane_id=int(target_lane_id),

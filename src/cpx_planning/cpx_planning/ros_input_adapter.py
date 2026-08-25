@@ -62,6 +62,7 @@ class ROSInputAdapter:
         self.lane_safety_scorer = bridge.lane_safety_scorer
         self.mpc = bridge.mpc
         self.min_front_gap_m = float(bridge.min_front_gap_m)
+        self.min_front_gap_time_s = float(bridge.min_front_gap_time_s)
         self.min_ttc_s = float(bridge.config.get("prediction_min_ttc_s", 2.0))
         self.communication_range_m = max(0.0, float(bridge.config.get("communication_range_m", 80.0)))
         self.config = bridge.config
@@ -210,7 +211,7 @@ class ROSInputAdapter:
         if ego_waypoint is None:
             raise RuntimeError("Custom global planner could not find the ego waypoint.")
 
-        current_lane_id = int(self._lane_id_tracker.update(ego_waypoint))
+        current_lane_id = int(self._lane_id_tracker.update(ego_waypoint, on_discontinuity=self.bridge._record_lane_id_discontinuity))
         if current_lane_id == 0:
             current_lane_id = 1
 
@@ -230,11 +231,6 @@ class ROSInputAdapter:
         )
 
         cp_obstacles = [dict(item) for item in list(cp_payload.get("obstacles", []) or [])]
-        lane_assignments = self.bridge._assign_obstacles_to_lanes(object_snapshots)
-        lane_safety_scores = self.lane_safety_scorer.compute_lane_scores(ego_snapshot=ego_snapshot, obstacle_snapshots=object_snapshots, lane_assignments=lane_assignments, ego_lane_id=int(current_lane_id), available_lane_ids=lane_ids, timestamp_s=float(snapshot.timestamp_s))
-        self.lane_safety_scorer.cleanup_stale_obstacles(set(lane_assignments.keys()))
-        front_dist_by_lane = self.bridge._nearest_front_distance_by_lane(ego_snapshot=ego_snapshot, obstacle_snapshots=object_snapshots, lane_assignments=lane_assignments, available_lane_ids=lane_ids)
-
         route_points = self.bridge._active_global_route_points()
         route_summary = self.bridge._planning_module_global_route_summary(
             ego_location=PlannerLocation(x=float(ego_pose["x"]), y=float(ego_pose["y"]), z=float(ego_pose.get("z", 0.0))),
@@ -266,7 +262,7 @@ class ROSInputAdapter:
             sim_time_s=float(snapshot.timestamp_s),
         )
         signal_context, stop_target = self.bridge._traffic_context_from_cp_control(selected_control=selected_control, ego_location=ego_location_value)
-        if bool(self.config.get("ignore_traffic_control", False)):
+        if bool(self.config.get("ignore_traffic_control", True)):
             signal_context = {"signal_state": "unknown", "signal_source": "disabled_by_planner_config", "traffic_control_from_cp": False}
             stop_target = None
         traffic_control_context = TrafficControlContext.from_signal_context(
@@ -280,7 +276,7 @@ class ROSInputAdapter:
             signal_context=signal_context,
             stop_target=stop_target,
         )
-        lane_assignments = self.bridge._assign_obstacles_to_lanes(tracked_obstacles)
+        lane_assignments = self.bridge._assign_obstacles_to_lanes(tracked_obstacles, ego_waypoint=ego_waypoint, ego_lane_id=int(current_lane_id))
         lane_safety_scores = self.lane_safety_scorer.compute_lane_scores(
             ego_snapshot=ego_snapshot,
             obstacle_snapshots=tracked_obstacles,
@@ -296,14 +292,15 @@ class ROSInputAdapter:
             lane_assignments=lane_assignments,
             available_lane_ids=lane_ids,
         )
+        speed_scaled_min_gap_m = max(self.min_front_gap_m, float(self.bridge.target_speed_mps) * self.min_front_gap_time_s)
         prediction_frame = self.tracker.predict(
             ego_snapshot=ego_snapshot,
             lane_assignments=lane_assignments,
             available_lane_ids=lane_ids,
             horizon_s=float(self.mpc.horizon_s),
             dt_s=float(self.mpc.dt_s),
-            min_front_gap_m=self.min_front_gap_m,
-            min_rear_gap_m=self.min_front_gap_m,
+            min_front_gap_m=float(speed_scaled_min_gap_m),
+            min_rear_gap_m=float(speed_scaled_min_gap_m),
             min_ttc_s=self.min_ttc_s,
             lane_step_fn=self.bridge._obstacle_lane_step_fn(),
         )

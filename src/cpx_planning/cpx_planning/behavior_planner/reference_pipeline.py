@@ -817,11 +817,15 @@ def generate_mpc_reference(
         context.stop_release_temp_smooth_until_sim_time_s
     )
 
+    # Keep mission-route points available as *topology guidance* even for
+    # ordinary lane-follow.  ``follow_global_route_lane`` still controls
+    # whether route XY becomes the actual reference geometry; when it is
+    # false, the points are used only to resolve ambiguous waypoint.next()
+    # successors and the emitted samples remain CARLA lane centers.
     reference_route_points = (
         active_global_route_points
         if (
-            bool(reference_intent.follow_global_route_lane)
-            and not bool(is_fixed_stop_decision(current_applied_behavior))
+            not bool(is_fixed_stop_decision(current_applied_behavior))
             and not bool(traffic_control_lane_lock_active)
         )
         else []

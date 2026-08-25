@@ -3,6 +3,7 @@
 """Subscribe to ROS data, print it, and forward planner output to OpenCDA."""
 
 import json
+import time
 
 from autoware_control_msgs.msg import Control
 from autoware_perception_msgs.msg import TrackedObjects
@@ -14,6 +15,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from .tcp_json_sender import ros_message_to_dict
 from .tcp_json_sender import TcpJsonSender
+from .timing import configure_timing
 
 
 # Keeping the topic name and its message type together makes it easy to add
@@ -45,6 +47,7 @@ class DataSubscriber(Node):
         super().__init__("opencda_data_subscriber")
         self.declare_parameter("debug", False)
         self.debug = bool(self.get_parameter("debug").value)
+        self.debug_time, self.timing_publisher, self.timing_stream = configure_timing(self, "output_forwarder")
 
         # Port 5060 carries the typed ROS data back to Python 3.7/OpenCDA.
         self.sender = TcpJsonSender(5060, self.get_logger())
@@ -69,6 +72,7 @@ class DataSubscriber(Node):
 
     def print_message(self, data_type, message):
         """Print one typed ROS message and send a JSON copy to OpenCDA."""
+        output_topic_received_wall_time_ns = time.time_ns()
         # ROS already formats typed messages in a readable field-by-field form.
         if self.debug:
             if data_type == "debug_output":
@@ -99,6 +103,7 @@ class DataSubscriber(Node):
             try:
                 compact_control = json.loads(str(message.data))
                 cycle_time_s = float(compact_control["cycle_time_s"])
+                compact_control["ros_output_subscriber_received_wall_time_ns"] = int(output_topic_received_wall_time_ns)
                 forwarded_data["message_type"] = "planner_control"
                 forwarded_data["data"] = compact_control
                 forwarded_data["timestamp_s"] = cycle_time_s
@@ -107,7 +112,17 @@ class DataSubscriber(Node):
 
         # Keep the comparison stream and the real control stream available at the same time.
         if data_type in {"debug_output", "planner_control_output"}:
+            if data_type == "planner_control_output":
+                output_tcp_send_started_wall_time_ns = time.time_ns()
+                forwarded_data["data"]["ros_output_tcp_send_started_wall_time_ns"] = int(output_tcp_send_started_wall_time_ns)
+            else:
+                output_tcp_send_started_wall_time_ns = 0
             self.sender.send(forwarded_data)
+            if self.timing_publisher is not None and data_type == "planner_control_output":
+                output_tcp_sent_wall_time_ns = time.time_ns()
+                event = String()
+                event.data = json.dumps({"cycle_id": max(0, int(round(float(forwarded_data["timestamp_s"]) * 1000000000.0))), "stream": "output_forwarder", "output_topic_received_wall_time_ns": int(output_topic_received_wall_time_ns), "output_tcp_send_started_wall_time_ns": int(output_tcp_send_started_wall_time_ns), "output_tcp_sent_wall_time_ns": int(output_tcp_sent_wall_time_ns), "output_topic_to_tcp_send_ms": (output_tcp_sent_wall_time_ns - output_topic_received_wall_time_ns) / 1000000.0, "output_callback_to_tcp_send_started_ms": (output_tcp_send_started_wall_time_ns - output_topic_received_wall_time_ns) / 1000000.0, "output_tcp_send_duration_ms": (output_tcp_sent_wall_time_ns - output_tcp_send_started_wall_time_ns) / 1000000.0}, allow_nan=False, separators=(",", ":"))
+                self.timing_publisher.publish(event)
 
     def destroy_node(self):
         """Close the TCP connection before shutting down the ROS node."""
